@@ -137,10 +137,10 @@ quaternion calculatePIDTargetAngle(vector3 position, vector3 targetPosition, qua
     };
     vector3 tWorld = normalize(toTarget);
 
-    vector3 fBody; // kehon "eteenpäin meno suunta"
+    vector3 fBody; // kehon "eteenpäin meno suunta" yksikkövektorina
     fBody.x = 0;
     fBody.y = 0;
-    fBody.z = 1.570;
+    fBody.z = 1.0;
 
     vector3 fWorld = rotateVectorByQuaternion(fBody, rotation); // worldspace suunta dronen "keholla"
 
@@ -197,4 +197,5 @@ int main() {
   q = calculatePIDTargetAngle(pos, tPos, rot);
   cout << q.w << " "<< q.x << " "<< q.y << " "<< q.z << " ";
   return 0;
+
 } 
