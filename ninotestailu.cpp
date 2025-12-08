@@ -34,7 +34,7 @@ PIDResult pidUpdate(double input, double setpoint,
 }
 
 string curState = "STABILIZE"; // HEITETTY --> STABILIZE --> FLIGHT --> LAND
-double thrust = 0.50; // base thrust
+double thrust = 0.33; // base thrust
 
 // INIT variables
 double measuredRoll  = 0.0;
@@ -134,3 +134,4 @@ int main() {
 
     return 0;
 }
+
