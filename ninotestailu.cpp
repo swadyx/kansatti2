@@ -58,9 +58,9 @@ int main() {
     };
 
     // NÄÄ KORVATAAN MITTA DATAL
-    double roll  = measuredRoll; // rad, IMU measurement
-    double pitch = measuredPitch; 
-    double yaw   = measuredYaw;
+    double roll  = 0; // rad, IMU measurement
+    double pitch = 0; 
+    double yaw   = 0;
     vector3 curPosition = measuredPos;
     vector3 targetPosition = startPos;
     // -------------------------------------------
@@ -101,7 +101,7 @@ int main() {
         // kun tarpeeks lähellä targettia, vaihda "LAND"
         if (curState == "FLIGHT") {
             double distance = sqrt(pow(targetPosition.x - curPosition.x, 2) +
-                                    pow(targetPosition.y - curPosition.y, 2) +);
+                                    pow(targetPosition.y - curPosition.y, 2));
             if (distance < 0.5) {
                 curState = "LAND";
             }
@@ -110,9 +110,9 @@ int main() {
         vector3 lastPosition = curPosition;
         thrust = clamp(thrust, 0.1, 1.0);
     }else{ // Jos STABILIZE tila
-        rollPID  = pidUpdate(roll,  rollSet, 0.05, 0.002, 0.001, rollPID);
-        pitchPID = pidUpdate(pitch, pitchSet,0.05, 0.002, 0.001, pitchPID);
-        yawPID   = pidUpdate(yaw,   yawSet,  0.05, 0.002, 0.001, yawPID);
+        rollPID  = pidUpdate(roll,  0, 0.05, 0.002, 0.001, rollPID);
+        pitchPID = pidUpdate(pitch, 0, 0.05, 0.002, 0.001, pitchPID);
+        yawPID   = pidUpdate(yaw,   0, 0.05, 0.002, 0.001, yawPID);
 
         motor1_pwm = 1000 + clamp(thrust - rollPID.output + pitchPID.output + yawPID.output, 0.1, 1)*2000;
         motor2_pwm = 1000 + clamp(thrust + rollPID.output - pitchPID.output + yawPID.output, 0.1, 1)*2000;
