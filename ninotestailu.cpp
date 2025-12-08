@@ -33,80 +33,104 @@ PIDResult pidUpdate(double input, double setpoint,
     return s;
 }
 
+string curState = "FLIGHT"; // HEITETTY --> STABILIZE --> FLIGHT --> LAND
+double thrust = 0.80; // base thrust
+
+// INIT variables
+double measuredRoll  = 0.0;
+double measuredPitch = 0.0; 
+double measuredYaw   = 0.0; 
+vector3 measuredPos  = {0, 0, 0};
+vector3 startPos     = {0, 10, 0};
+vector3 lastPosition = {0,0,0};
+
+PIDResult rollPID  = {0,0,0,0};
+PIDResult pitchPID = {0,0,0,0};
+PIDResult yawPID   = {0,0,0,0};
+PIDResult xPID = {0,0,0,0};
+PIDResult yPID = {0,0,0,0};
+
 int main() {
-    // NÄÄ KORVATAAN MITTA DATAL
-    double roll  = 0.2; // rad, IMU measurement
-    double pitch = -0.1; 
-    double yaw   = 0.0;
-    vector3 curPosition = {0, 0, 0};
-    vector3 targetPosition = {0, 10, 0};
-    // __________________________________________________
-
-    double thrust = 0.80; // base thrust
-    double motor1_pwm, motor2_pwm, motor3_pwm, motor4_pwm;
-
-    PIDResult rollPID  = {0,0,0,0};
-    PIDResult pitchPID = {0,0,0,0};
-    PIDResult yawPID   = {0,0,0,0};
-    PIDResult xPID = {0,0,0,0};
-    PIDResult yPID = {0,0,0,0};
-
-    // claculate PID for position control
-    xPID = pidUpdate(curPosition.x, targetPosition.x, 0.2, 0.0, 0.01, xPID);
-    yPID = pidUpdate(curPosition.y, targetPosition.y, 0.2, 0.0, 0.01, yPID);
-
-    double rollSet  = xPID.output;     // oikee / vase
-    double pitchSet = -yPID.output;    // loput
-    double yawSet   = 0.0; // älä pyöri
-
-    // Clamp ettei vedä flipoi
-    auto clampAngle = [](double a){
-        if (a > 0.5) a = 0.5;
-        if (a < -0.5) a = -0.5;
+    auto clamp = [](double a, double min, double max){
+        if (a < min) a = min; // EI ikinä moottoreita nollaan!!
+        if (a > max) a = max;
         return a;
     };
 
-    rollSet  = clampAngle(rollSet);
-    pitchSet = clampAngle(pitchSet);
+    // NÄÄ KORVATAAN MITTA DATAL
+    double roll  = measuredRoll; // rad, IMU measurement
+    double pitch = measuredPitch; 
+    double yaw   = measuredYaw;
+    vector3 curPosition = measuredPos;
+    vector3 targetPosition = startPos;
+    // -------------------------------------------
 
-    for (int i = 0; i < 100; i++) {
+    double motor1_pwm, motor2_pwm, motor3_pwm, motor4_pwm;
+
+    if (curState != "STABILIZE")
+    {
+        // claculate PID for position control
+        xPID = pidUpdate(curPosition.x, targetPosition.x, 0.2, 0.0, 0.01, xPID);
+        yPID = pidUpdate(curPosition.y, targetPosition.y, 0.2, 0.0, 0.01, yPID);
+
+        double rollSet  = xPID.output;     // oikee / vase
+        double pitchSet = -yPID.output;    // loput
+        double yawSet   = 0.0; // älä pyöri
+
+        // Clamp ettei vedä flipoi
+        rollSet  = clamp(rollSet, -0.5, 0.5);
+        pitchSet = clamp(pitchSet, -0.5, 0.5);
+
         rollPID  = pidUpdate(roll,  rollSet, 0.05, 0.002, 0.001, rollPID);
         pitchPID = pidUpdate(pitch, pitchSet,0.05, 0.002, 0.001, pitchPID);
         yawPID   = pidUpdate(yaw,   yawSet,  0.05, 0.002, 0.001, yawPID);
 
-        cout << "Step " << i << ": ";
-        cout << "| Roll: " << rollPID.output << " ";
-        cout << "| Pitch: " << pitchPID.output << " ";
-        cout << "| Yaw: " << yawPID.output << endl;
+        motor1_pwm = clamp(thrust - rollPID.output + pitchPID.output + yawPID.output, 0.1, 1)*2000;
+        motor2_pwm = clamp(thrust + rollPID.output - pitchPID.output + yawPID.output, 0.1, 1)*2000;
+        motor3_pwm = clamp(thrust + rollPID.output + pitchPID.output - yawPID.output, 0.1, 1)*2000;
+        motor4_pwm = clamp(thrust - rollPID.output - pitchPID.output - yawPID.output, 0.1, 1)*2000;
 
-        // Simulate drone movement
-        double ax = sin(roll)  * thrust * 2.0;
-        double ay = sin(pitch) * thrust * 2.0;
+        if ((lastPosition.y - curPosition.y) >= 0.01) { // nousu
+            thrust += -0.001; // AINA LASKEUDUTAAN MIKÄÄN TILA EI NOSTA
+        } else if ((curPosition.y - lastPosition.y) >= 0.01) { // lasku
+            thrust += (curState == "FLIGHT") ? +0.001 : 0; // jos laskeudutaan flight tilassa nosta muissa jatka laskeutumista
+        } else{  // leijunta
+            thrust += (curState == "FLIGHT") ? +0.001 : 0; // jos leijutaan flight tilassa nosta muissa jatka laskeutumista
+        }
 
-        curPosition.x += ax * 0.05;
-        curPosition.y += ay * 0.05;
+        // kun tarpeeks lähellä targettia, vaihda "LAND"
+        if (curState == "FLIGHT") {
+            double distance = sqrt(pow(targetPosition.x - curPosition.x, 2) +
+                                    pow(targetPosition.y - curPosition.y, 2) +);
+            if (distance < 0.5) {
+                curState = "LAND";
+            }
+        }
 
-        cout << "Position: (" << curPosition.x << ", " << curPosition.y << ")" << endl;
+        vector3 lastPosition = curPosition;
+        thrust = clamp(thrust, 0.1, 1.0);
+    }else{ // Jos STABILIZE tila
+        rollPID  = pidUpdate(roll,  rollSet, 0.05, 0.002, 0.001, rollPID);
+        pitchPID = pidUpdate(pitch, pitchSet,0.05, 0.002, 0.001, pitchPID);
+        yawPID   = pidUpdate(yaw,   yawSet,  0.05, 0.002, 0.001, yawPID);
 
-
-        auto clamp = [](double v){
-            if (v < 0.1) v = 0.1; // EI ikinä moottoreita nollaan!!
-            if (v > 1) v = 1;
-            return v;
-        };
-
-        motor1_pwm = clamp(thrust - rollPID.output + pitchPID.output + yawPID.output)*2000;
-        motor2_pwm = clamp(thrust + rollPID.output - pitchPID.output + yawPID.output)*2000;
-        motor3_pwm = clamp(thrust + rollPID.output + pitchPID.output - yawPID.output)*2000;
-        motor4_pwm = clamp(thrust - rollPID.output - pitchPID.output - yawPID.output)*2000;
-
-        cout << "Motor PWMs: "
-            << motor1_pwm << ", "
-            << motor2_pwm << ", "
-            << motor3_pwm << ", "
-            << motor4_pwm << endl;
-            cout << "\n";
+        motor1_pwm = 1000 + clamp(thrust - rollPID.output + pitchPID.output + yawPID.output, 0.1, 1)*2000;
+        motor2_pwm = 1000 + clamp(thrust + rollPID.output - pitchPID.output + yawPID.output, 0.1, 1)*2000;
+        motor3_pwm = 1000 + clamp(thrust + rollPID.output + pitchPID.output - yawPID.output, 0.1, 1)*2000;
+        motor4_pwm = 1000 + clamp(thrust - rollPID.output - pitchPID.output - yawPID.output, 0.1, 1)*2000;
     }
+
+    
+    cout << "| Roll: " << rollPID.output << " ";
+    cout << "| Pitch: " << pitchPID.output << " ";
+    cout << "| Yaw: " << yawPID.output << endl;
+        
+    cout << "Motor PWMs: "
+        << motor1_pwm << ", "
+        << motor2_pwm << ", "
+        << motor3_pwm << ", "
+        << motor4_pwm << endl;
+        cout << "\n";
 
     return 0;
 }
