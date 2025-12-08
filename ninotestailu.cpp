@@ -33,8 +33,8 @@ PIDResult pidUpdate(double input, double setpoint,
     return s;
 }
 
-string curState = "FLIGHT"; // HEITETTY --> STABILIZE --> FLIGHT --> LAND
-double thrust = 0.80; // base thrust
+string curState = "STABILIZE"; // HEITETTY --> STABILIZE --> FLIGHT --> LAND
+double thrust = 0.50; // base thrust
 
 // INIT variables
 double measuredRoll  = 0.0;
@@ -108,7 +108,7 @@ int main() {
         }
 
         vector3 lastPosition = curPosition;
-        thrust = clamp(thrust, 0.1, 1.0);
+        thrust = clamp(thrust, 0 , 0.5);
     }else{ // Jos STABILIZE tila
         rollPID  = pidUpdate(roll,  0, 0.05, 0.002, 0.001, rollPID);
         pitchPID = pidUpdate(pitch, 0, 0.05, 0.002, 0.001, pitchPID);
