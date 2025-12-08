@@ -33,7 +33,7 @@ PIDResult pidUpdate(double input, double setpoint,
     return s;
 }
 
-string curState = "STABILIZE"; // HEITETTY --> STABILIZE --> FLIGHT --> LAND
+string curState = "FLIGHT"; // HEITETTY --> STABILIZE --> FLIGHT --> LAND
 double thrust = 0.33; // base thrust
 
 // INIT variables
@@ -41,7 +41,7 @@ double measuredRoll  = 0.0;
 double measuredPitch = 0.0; 
 double measuredYaw   = 0.0; 
 vector3 measuredPos  = {0, 0, 0};
-vector3 startPos     = {0, 10, 0};
+vector3 startPos     = {10, 10, 0};
 vector3 lastPosition = {0,0,0};
 
 PIDResult rollPID  = {0,0,0,0};
@@ -52,7 +52,7 @@ PIDResult yPID = {0,0,0,0};
 
 int main() {
     auto clamp = [](double a, double min, double max){
-        if (a < min) a = min; // EI ikinä moottoreita nollaan!!
+        if (a < min) a = min;
         if (a > max) a = max;
         return a;
     };
@@ -85,17 +85,17 @@ int main() {
         pitchPID = pidUpdate(pitch, pitchSet,0.05, 0.002, 0.001, pitchPID);
         yawPID   = pidUpdate(yaw,   yawSet,  0.05, 0.002, 0.001, yawPID);
 
-        motor1_pwm = clamp(thrust - rollPID.output + pitchPID.output + yawPID.output, 0.1, 1)*2000;
-        motor2_pwm = clamp(thrust + rollPID.output - pitchPID.output + yawPID.output, 0.1, 1)*2000;
-        motor3_pwm = clamp(thrust + rollPID.output + pitchPID.output - yawPID.output, 0.1, 1)*2000;
-        motor4_pwm = clamp(thrust - rollPID.output - pitchPID.output - yawPID.output, 0.1, 1)*2000;
+        motor1_pwm = clamp(1000 +clamp(thrust - rollPID.output + pitchPID.output + yawPID.output, 0.1, 1)*2000, 0, 2000);
+        motor2_pwm = clamp(1000 +clamp(thrust + rollPID.output - pitchPID.output + yawPID.output, 0.1, 1)*2000, 0, 2000);
+        motor3_pwm = clamp(1000 +clamp(thrust + rollPID.output + pitchPID.output - yawPID.output, 0.1, 1)*2000, 0, 2000);
+        motor4_pwm = clamp(1000 +clamp(thrust - rollPID.output - pitchPID.output - yawPID.output, 0.1, 1)*2000, 0, 2000);
 
         if ((lastPosition.y - curPosition.y) >= 0.01) { // nousu
             thrust += -0.001; // AINA LASKEUDUTAAN MIKÄÄN TILA EI NOSTA
         } else if ((curPosition.y - lastPosition.y) >= 0.01) { // lasku
             thrust += (curState == "FLIGHT") ? +0.001 : 0; // jos laskeudutaan flight tilassa nosta muissa jatka laskeutumista
         } else{  // leijunta
-            thrust += (curState == "FLIGHT") ? +0.001 : 0; // jos leijutaan flight tilassa nosta muissa jatka laskeutumista
+            thrust += (curState == "FLIGHT") ? 0 : -0.001; // jos leijutaan flight tilassa nosta muissa jatka laskeutumista
         }
 
         // kun tarpeeks lähellä targettia, vaihda "LAND"
@@ -114,10 +114,10 @@ int main() {
         pitchPID = pidUpdate(pitch, 0, 0.05, 0.002, 0.001, pitchPID);
         yawPID   = pidUpdate(yaw,   0, 0.05, 0.002, 0.001, yawPID);
 
-        motor1_pwm = 1000 + clamp(thrust - rollPID.output + pitchPID.output + yawPID.output, 0.1, 1)*2000;
-        motor2_pwm = 1000 + clamp(thrust + rollPID.output - pitchPID.output + yawPID.output, 0.1, 1)*2000;
-        motor3_pwm = 1000 + clamp(thrust + rollPID.output + pitchPID.output - yawPID.output, 0.1, 1)*2000;
-        motor4_pwm = 1000 + clamp(thrust - rollPID.output - pitchPID.output - yawPID.output, 0.1, 1)*2000;
+        motor1_pwm = clamp(1000 +clamp(thrust - rollPID.output + pitchPID.output + yawPID.output, 0.1, 1)*2000, 0, 2000);
+        motor2_pwm = clamp(1000 +clamp(thrust + rollPID.output - pitchPID.output + yawPID.output, 0.1, 1)*2000, 0, 2000);
+        motor3_pwm = clamp(1000 +clamp(thrust + rollPID.output + pitchPID.output - yawPID.output, 0.1, 1)*2000, 0, 2000);
+        motor4_pwm = clamp(1000 +clamp(thrust - rollPID.output - pitchPID.output - yawPID.output, 0.1, 1)*2000, 0, 2000);
     }
 
     
@@ -134,4 +134,3 @@ int main() {
 
     return 0;
 }
-
