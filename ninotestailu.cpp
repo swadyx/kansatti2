@@ -13,7 +13,6 @@ struct PIDResult {
     double integral;
     unsigned long previousMillis;
 };
-// Output is rad/s
 PIDResult pidUpdate(double input, double setpoint,
                     double kp, double ki, double kd,
                     PIDResult s){
@@ -33,13 +32,14 @@ PIDResult pidUpdate(double input, double setpoint,
     return s;
 }
 
-string curState = "FLIGHT"; // HEITETTY --> STABILIZE --> FLIGHT --> LAND
+string curState = "FLIGHT"; // STABILIZE --> FLIGHT --> LAND
 double thrust = 0.33; // base thrust
 
 // INIT variables
 double measuredRoll  = 0.0;
 double measuredPitch = 0.0; 
 double measuredYaw   = 0.0; 
+double descentFallVelocity = 0.0; // Kuinka nopeesti halutaan pudota
 vector3 measuredPos  = {0, 0, 0};
 vector3 startPos     = {10, 10, 0};
 vector3 lastPosition = {0,0,0};
@@ -58,11 +58,12 @@ int main() {
     };
 
     // NÄÄ KORVATAAN MITTA DATAL
-    double roll  = 0; // rad, IMU measurement
-    double pitch = 0; 
-    double yaw   = 0;
+    double roll  = measuredRoll; // rad, IMU measurement
+    double pitch = measuredPitch; 
+    double yaw   = measuredYaw;
     vector3 curPosition = measuredPos;
     vector3 targetPosition = startPos;
+    vector3 currentVelocity = {0,0,0};
     // -------------------------------------------
 
     double motor1_pwm, motor2_pwm, motor3_pwm, motor4_pwm;
@@ -90,15 +91,22 @@ int main() {
         motor3_pwm = clamp(1000 +clamp(thrust + rollPID.output + pitchPID.output - yawPID.output, 0.1, 1)*2000, 0, 2000);
         motor4_pwm = clamp(1000 +clamp(thrust - rollPID.output - pitchPID.output - yawPID.output, 0.1, 1)*2000, 0, 2000);
 
-        if ((lastPosition.y - curPosition.y) >= 0.01) { // nousu
-            thrust += -0.001; // AINA LASKEUDUTAAN MIKÄÄN TILA EI NOSTA
-        } else if ((curPosition.y - lastPosition.y) >= 0.01) { // lasku
-            thrust += (curState == "FLIGHT") ? +0.001 : 0; // jos laskeudutaan flight tilassa nosta muissa jatka laskeutumista
-        } else{  // leijunta
-            thrust += (curState == "FLIGHT") ? 0 : -0.001; // jos leijutaan flight tilassa nosta muissa jatka laskeutumista
+        // Jokaisessa tilassa pitää laskeutua
+        if(abs(lastPosition.y - curPosition.y) >= 0.01) {
+            if ((lastPosition.y - curPosition.y) >= 0) { // Jos me nousaan ylöspäin ( ei pitäis olla mahdollista )
+                thrust += (curPosition.y < (targetPosition.y + 15)) ? (curState=="FLIGHT") ? 0.001 : -0.001 : -0.001; // jos ollaan liian alhaalla ja lento tilassa nosta muulloin laske
+            }else{ // Pudotaan
+                if (currentVelocity.y > descentFallVelocity) { // Jos pudotaan hitaammin kuin halutaan pudotaan nopeemmin
+                    thrust += (curPosition.y < (targetPosition.y + 15)) ? -0.001 : (curState=="FLIGHT") ? 0.001 : -0.001; // Jos ollaan liian alhaalla nosta ellei oo lakseutumis tila
+                }else{
+                    if (descentFallVelocity  > currentVelocity.y) { // Nyt pudotaan jo liian kovaa, hidastus
+                        thrust += 0.001;
+                    }
+                }
+            }
         }
 
-        // kun tarpeeks lähellä targettia, vaihda "LAND"
+        // kun tarpeeks lähellä targettia, vaihda "LAND" ei oteta korkeutta huomioon koska voidaan joko olla helveti korkeel tai just ja just siin raja korkeudes
         if (curState == "FLIGHT") {
             double distance = sqrt(pow(targetPosition.x - curPosition.x, 2) +
                                     pow(targetPosition.y - curPosition.y, 2));
@@ -107,9 +115,9 @@ int main() {
             }
         }
 
-        vector3 lastPosition = curPosition;
-        thrust = clamp(thrust, 0 , 0.5);
-    }else{ // Jos STABILIZE tila
+        vector3 lastPosition = curPosition; // Vaihetaan arvot ens looppia varten
+        thrust = clamp(thrust, 0 , .5); // Ei thrusti yli- tai aliammu
+    }else{ // Jos STABILIZE tila eli ei vielä liikuta halutaan vaa suoraa raketista ittensä pysty suoraks
         rollPID  = pidUpdate(roll,  0, 0.05, 0.002, 0.001, rollPID);
         pitchPID = pidUpdate(pitch, 0, 0.05, 0.002, 0.001, pitchPID);
         yawPID   = pidUpdate(yaw,   0, 0.05, 0.002, 0.001, yawPID);
@@ -120,7 +128,7 @@ int main() {
         motor4_pwm = clamp(1000 +clamp(thrust - rollPID.output - pitchPID.output - yawPID.output, 0.1, 1)*2000, 0, 2000);
     }
 
-    
+    // printtaa output    
     cout << "| Roll: " << rollPID.output << " ";
     cout << "| Pitch: " << pitchPID.output << " ";
     cout << "| Yaw: " << yawPID.output << endl;
