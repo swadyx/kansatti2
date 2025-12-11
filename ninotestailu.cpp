@@ -16,7 +16,7 @@ struct PIDResult {
 PIDResult pidUpdate(double input, double setpoint,
                     double kp, double ki, double kd,
                     PIDResult s){
-    unsigned long now = s.previousMillis + 5; 
+    unsigned long now = millis(); 
     double dt = (now - s.previousMillis) / 1000.0;
     if (dt <= 0) dt = 0.001;
 
@@ -50,7 +50,19 @@ PIDResult yawPID   = {0,0,0,0};
 PIDResult xPID = {0,0,0,0};
 PIDResult yPID = {0,0,0,0};
 
+double mainLoopHz = 100; // Callataan tasaisen tahtiin mainLooppia
+double lastLoop = 0;
+
 int main() {
+    while (true) {
+        if ((lastLoop-millis()) >= 100/mainLoopHz) {
+            lastLoop = millis();
+            mainLoop();
+        }
+    }
+    return 0;
+}
+void mainLoop() {
     auto clamp = [](double a, double min, double max){
         if (a < min) a = min;
         if (a > max) a = max;
@@ -105,7 +117,6 @@ int main() {
                 }
             }
         }
-
         // kun tarpeeks lähellä targettia, vaihda "LAND" ei oteta korkeutta huomioon koska voidaan joko olla helveti korkeel tai just ja just siin raja korkeudes
         if (curState == "FLIGHT") {
             double distance = sqrt(pow(targetPosition.x - curPosition.x, 2) +
@@ -114,8 +125,7 @@ int main() {
                 curState = "LAND";
             }
         }
-
-        vector3 lastPosition = curPosition; // Vaihetaan arvot ens looppia varten
+        lastPosition = curPosition; // Vaihetaan arvot ens looppia varten
         thrust = clamp(thrust, 0 , .5); // Ei thrusti yli- tai aliammu
     }else{ // Jos STABILIZE tila eli ei vielä liikuta halutaan vaa suoraa raketista ittensä pysty suoraks
         rollPID  = pidUpdate(roll,  0, 0.05, 0.002, 0.001, rollPID);
@@ -140,5 +150,4 @@ int main() {
         << motor4_pwm << endl;
         cout << "\n";
 
-    return 0;
 }
