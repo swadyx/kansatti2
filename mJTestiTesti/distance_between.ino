@@ -12,3 +12,7 @@ double DISTANCE_BETWEEN(double lat1, double lon1, double lat2, double lon2) {
 double deg_to_rad(double deg) {
   return deg * (3.141592653589793 / 180.0);
 }
+
+//Can be used to calculate cansat drone's travelled distance between two coordinates. 
+//Can modify to also give the heading where travelled distance is done towards, 
+//and also estimate speed by dividing the calculated distace with Delta(time).
