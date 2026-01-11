@@ -1,0 +1,29 @@
+#include "CanSatNeXT.h"
+// vase
+#define J1_X 32
+#define J1_Y 33
+
+//oikia
+#define J2_X 34
+#define J2_Y 35
+#define DEADZONE 300
+#define CENTER 2048
+
+
+
+void setup() {
+  Serial.begin(115200);
+  CanSatInit(28);
+}
+
+void loop() {
+  int t = analogRead(J1_Y);
+  int y = analogRead(J1_X);
+  int p = analogRead(J2_Y);
+  int r = analogRead(J2_X);
+
+  String data = String(t) + "," + String(y) + "," + String(p) + "," + String(r);
+  sendData(data);
+
+  Serial.println("<<Datat lähetty dronelle! je kivaa pum>>");
+}
