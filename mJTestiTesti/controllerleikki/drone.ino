@@ -4,6 +4,7 @@
 #include <Adafruit_BMP280.h>
 #include "CanSatNeXT.h"
 
+// ================= OLED =================
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
@@ -158,9 +159,9 @@ void loop() {
   display.print("Pitch:"); display.println(KalmanAnglePitch);
 
   display.print("T:"); display.print(dir(j1y_val,"DOWN","UP"));
-  display.print("  Y:"); display.println(dir(j1x_val,"LEFT","RIGHT"));
+  display.print("  Y:"); display.println(dir(j1x_val,"RIGHT","LEFT"));
   display.print("P:"); display.print(dir(j2y_val,"BACK","FWD"));
-  display.print("  R:"); display.println(dir(j2x_val,"LEFT","RIGHT"));
+  display.print("  R:"); display.println(dir(j2x_val,"RIGHT","LEFT"));
 
   display.display();
 
