@@ -20,8 +20,16 @@ struct PIDResult {
     double integral;
     unsigned long previousMillis;
 };
+struct State {
+    quaternion q;   // orientation
+};
 
+struct Covariance {
+    double p[3][3];
+};
 // Utility functions
+const double LAT_TO_METERS = 111320.0;
+double lonToMeters(double latDeg) { return 111320.0 * cos(latDeg * M_PI/180.0); }
 vector3 normalize(vector3 v) {
     double n = sqrt(v.x*v.x + v.y*v.y + v.z*v.z);
     if (n < 1e-9) return {0,0,0};
@@ -45,7 +53,46 @@ auto clamp = [](double a, double min, double max){
     if (a > max) a = max;
     return a;
 };
+double alpha = .69;
+double sIIR(double newData, double oldData) {
+    return oldData+alpha*(newData-oldData);
+}; //simppeli IIR : y[n] = y[n-1]+a*(x[n]-y[n-1])
 
+// extended kalman voids
+void predict(State &x, vector3 gyro, double dt) {
+    quaternion wq = {0, gyro.x, gyro.y, gyro.z};
+
+    quaternion dq = {
+        0.5 * (-x.q.x*wq.x - x.q.y*wq.y - x.q.z*wq.z),
+        0.5 * ( x.q.w*wq.x + x.q.y*wq.z - x.q.z*wq.y),
+        0.5 * ( x.q.w*wq.y - x.q.x*wq.z + x.q.z*wq.x),
+        0.5 * ( x.q.w*wq.z + x.q.x*wq.y - x.q.y*wq.x)
+    };
+
+    x.q.w += dq.w * dt;
+    x.q.x += dq.x * dt;
+    x.q.y += dq.y * dt;
+    x.q.z += dq.z * dt;
+
+    x.q = normalizeQ(x.q);
+}
+void predictCov(Covariance &P, double noise, double dt) {
+    double q = noise * dt * dt;
+    for (int i = 0; i < 3; i++)
+        P.p[i][i] += q;
+}
+vector3 expectedAccel(const quaternion &q) {
+    return {
+        2*(q.x*q.z - q.w*q.y),
+        2*(q.w*q.x + q.y*q.z),
+        q.w*q.w - q.x*q.x - q.y*q.y + q.z*q.z
+    };
+}
+void jacobianH(const State &x, double H[3][3]) {
+    H[0][0] = 1; H[0][1] = 0; H[0][2] = 0;
+    H[1][0] = 0; H[1][1] = 1; H[1][2] = 0;
+    H[2][0] = 0; H[2][1] = 0; H[2][2] = 1;
+}
 // PID update function
 PIDResult pidUpdate(double input, double setpoint,
                     double kp, double ki, double kd,
@@ -68,35 +115,33 @@ PIDResult pidUpdate(double input, double setpoint,
     return s;
 }
 
-// Parameters
-double beta = 0.13;
-double descentFallVelocity = 0.0; // Kuinka nopeesti halutaan pudota
-
 // Mitta data
-vector3 gyroData = {0,0,0};   // rad/s
-vector3 accelData = {0,0,0};  // m/s^2
-vector3 magData = {0,0,0};
+vector3 gyroData  = {0,0,0}; // rad/s
+vector3 accelData = {0,0,0}; // m/s^2
+//vector3 magData   = {0,0,0};
+vector3 gpsData   = {0,0,0}; // deg, deg, m (above sea)
 
-// INIT variables ja variablet joita ei saa muokata ennen
-string curState = "FLIGHT"; // STABILIZE --> FLIGHT --> LAND
-double thrust = 0.45; // base thrust
-vector3 measuredPos  = {0, 0, 0};
+// INIT variable 
+vector3 calculatedPosition = {0, 0, 0};
+vector3 measuredPos        = {0, 0, 0};
+vector3 lastPosition       = {0, 0, 0};
 vector3 startPos     = {0, 0, 0};
-vector3 lastPosition = {0,0,0};
-
-quaternion fusedOrientation = {1,0,0,0};
+vector3 targetPosition     = {0, 0 ,0};
 PIDResult rollPID  = {0,0,0,0};
 PIDResult pitchPID = {0,0,0,0};
 PIDResult yawPID   = {0,0,0,0};
 PIDResult xPID = {0,0,0,0};
 PIDResult yPID = {0,0,0,0};
+double descentFallVelocity = 0.0; // Kuinka nopeesti halutaan pudota
+string curState = "FLIGHT"; // STABILIZE --> FLIGHT --> LAND
+double thrust = 0.45; // base thrust
 
 void flightcontrollerLoop(double measuredRoll, double measuredPitch, double measuredYaw) {
     double roll  = measuredRoll; // rad, IMU measurement
     double pitch = measuredPitch; 
     double yaw   = measuredYaw;
 
-    vector3 curPosition = measuredPos;
+    vector3 measuredPos = measuredPos;
     vector3 targetPosition = startPos;
     vector3 currentVelocity = {0,0,0};
     // -------------------------------------------
@@ -106,8 +151,8 @@ void flightcontrollerLoop(double measuredRoll, double measuredPitch, double meas
     if (curState != "STABILIZE")
     {
         // claculate PID for position control
-        xPID = pidUpdate(curPosition.x, targetPosition.x, 0.2, 0.0, 0.01, xPID);
-        yPID = pidUpdate(curPosition.y, targetPosition.y, 0.2, 0.0, 0.01, yPID);
+        xPID = pidUpdate(measuredPos.x, targetPosition.x, 0.2, 0.0, 0.01, xPID);
+        yPID = pidUpdate(measuredPos.y, targetPosition.y, 0.2, 0.0, 0.01, yPID);
 
         double rollSet  = xPID.output;     // oikee / vase
         double pitchSet = -yPID.output;    // loput
@@ -129,12 +174,12 @@ void flightcontrollerLoop(double measuredRoll, double measuredPitch, double meas
 
         // ------------------------------------------- VAIHA TÄHÄN VAIK ALTIDUTA PID ------------------------------------------
         // Jokaisessa tilassa pitää laskeutua
-        if(abs(lastPosition.y - curPosition.y) >= 0.01) {
-            if ((lastPosition.y - curPosition.y) >= 0) { // Jos me nousaan ylöspäin ( ei pitäis olla mahdollista )
-                thrust += (curPosition.y < (targetPosition.y + 15)) ? (curState=="FLIGHT") ? 0.001 : -0.001 : -0.001; // jos ollaan liian alhaalla ja lento tilassa nosta muulloin laske
+        if(abs(lastPosition.y - measuredPos.y) >= 0.01) {
+            if ((lastPosition.y - measuredPos.y) >= 0) { // Jos me nousaan ylöspäin ( ei pitäis olla mahdollista )
+                thrust += (measuredPos.y < (targetPosition.y + 15)) ? (curState=="FLIGHT") ? 0.001 : -0.001 : -0.001; // jos ollaan liian alhaalla ja lento tilassa nosta muulloin laske
             }else{ // Pudotaan
                 if (currentVelocity.y > descentFallVelocity) { // Jos pudotaan hitaammin kuin halutaan pudotaan nopeemmin
-                    thrust += (curPosition.y < (targetPosition.y + 15)) ? -0.001 : (curState=="FLIGHT") ? 0.001 : -0.001; // Jos ollaan liian alhaalla nosta ellei oo lakseutumis tila
+                    thrust += (measuredPos.y < (targetPosition.y + 15)) ? -0.001 : (curState=="FLIGHT") ? 0.001 : -0.001; // Jos ollaan liian alhaalla nosta ellei oo lakseutumis tila
                 }else{
                     if (descentFallVelocity  > currentVelocity.y) { // Nyt pudotaan jo liian kovaa, hidastus
                         thrust += 0.001;
@@ -146,7 +191,7 @@ void flightcontrollerLoop(double measuredRoll, double measuredPitch, double meas
 
         // kun tarpeeks lähellä targettia, vaihda "LAND" ei oteta korkeutta huomioon koska voidaan joko olla helveti korkeel tai just ja just siin raja korkeudes
 
-        lastPosition = curPosition; // Vaihetaan arvot ens looppia varten
+        lastPosition = measuredPos; // Vaihetaan arvot ens looppia varten
         thrust = clamp(thrust, 0 , .5); // Ei thrusti yli- tai aliammu
     }else{ // Jos STABILIZE tila eli ei vielä liikuta halutaan vaa suoraa raketista ittensä pysty suoraks
         rollPID  = pidUpdate(roll,  0, 0.05, 0.002, 0.001, rollPID);
@@ -166,8 +211,6 @@ void flightcontrollerLoop(double measuredRoll, double measuredPitch, double meas
     motor3_pwm = clamp(m3 * 1000 + 1000, 1000, 2000);
     motor4_pwm = clamp(m4 * 1000 + 1000, 1000, 2000);
 
-
-
     // printtaa output  
     system("cls");
         
@@ -186,160 +229,138 @@ int main() {
         cout << "Unable to open file\n";
         return 1;
     }
-    // ei oo millisii pakko leikkii
-    auto nextTick = chrono::steady_clock::now();
+    vector3 lastGPS = {0,0,0};
+    double previousYaw = 0;
+    double currentYaw = 0;
+    // EKF init
+    State x = { {1,0,0,0} };
 
-    // ikune looppi
+    Covariance P = {{
+        {3,0,0},
+        {0,3,0},
+        {0,0,3}
+    }};
+    double accelNoise = 0.01;
+    double gyroNoise  = 0.02;
+
+    auto lastTime = chrono::high_resolution_clock::now();
+
     while (true) {
-        double dt = 0.02; // Deltatime on 0.02 simulaatiota varte
-
+        
         inFile.clear();
         inFile.seekg(0, ios::beg);
 
-        // nappaa tiedostosta datat jotka unity tuottaa
+        // unity -> file -> here
         vector<double> s;
         double v;
         while (inFile >> v) s.push_back(v);
         if (s.size() < 9) continue;
 
-        // aseta data
-        gyroData  = { s[0], s[1], s[2] };
-        accelData = { s[3], s[4], s[5] };
-        magData   = { s[6], s[7], s[8] };
+        // aseta data - pass trhough simple onepoint iir
+        vector3 n_gyroData  =  { sIIR(s[0],gyroData.x)
+                    ,    sIIR(s[1],gyroData.y)
+                    ,    sIIR(s[2],gyroData.z) };
 
-        quaternion q = fusedOrientation;
+        vector3 n_accelData  = { sIIR(s[3],accelData.x)
+                    ,    sIIR(s[4],accelData.y)
+                    ,    sIIR(s[5],accelData.z) };
 
-        // Normalize magnetometer
-        vector3 mNorm = normalize(magData);
-        // Normalize accelerometer
-        vector3 aNorm = normalize(accelData);
+        vector3 n_gpsData  =   { sIIR(s[9],gpsData.x)
+                    ,    sIIR(s[10],gpsData.y)
+                    ,    sIIR(s[11],gpsData.z) };
 
-        // lyhennä muuttujat
-        double ax = aNorm.x;
-        double ay = aNorm.y;
-        double az = aNorm.z;
-        double mx = mNorm.x;
-        double my = mNorm.y;
-        double mz = mNorm.z;
-        double q0 = q.w;
-        double q1 = q.x;
-        double q2 = q.y;
-        double q3 = q.z;
-        
-        // SUORAAN GPT mut kyl luin läpi ja ymmärsin jotai
-        // Rotate magnetometer into earth frame
-        double hx = 2*mx*(0.5 - q2*q2 - q3*q3)
-                + 2*my*(q1*q2 - q0*q3)
-                + 2*mz*(q1*q3 + q0*q2);
+        /*/ vector3 n_magData  =   { sIIR(s[6],magData.x)
+                    ,    sIIR(s[7],magData.y)
+                    ,    sIIR(s[8],magData.z) }; /*/
+                    
+        // Set data to new filtered data
+        gyroData = n_gyroData;
+        accelData = normalize(n_accelData);
+        gpsData = n_gpsData;
+        //magData = n_magData;
 
-        double hy = 2*mx*(q1*q2 + q0*q3)
-                + 2*my*(0.5 - q1*q1 - q3*q3)
-                + 2*mz*(q2*q3 - q0*q1);
+        auto now = chrono::high_resolution_clock::now();
+        double dt = chrono::duration<double>(now - lastTime).count();
 
-        double hz = 2*mx*(q1*q3 - q0*q2)
-                + 2*my*(q2*q3 + q0*q1)
-                + 2*mz*(0.5 - q1*q1 - q2*q2);
+        lastTime = now;
 
-        // Reference direction of Earth's field
-        double bx = sqrt(hx*hx + hy*hy);
-        double bz = hz;
+        predict(x, gyroData, dt);
+        predictCov(P, gyroNoise, dt);
 
-        double f4 = 2*bx*(0.5 - q2*q2 - q3*q3)
-                + 2*bz*(q1*q3 - q0*q2) - mx;
+        vector3 h = expectedAccel(x.q);
+        vector3 y = { accelData.x - h.x,
+                    accelData.y - h.y,
+                    accelData.z - h.z };
 
-        double f5 = 2*bx*(q1*q2 - q0*q3)
-                + 2*bz*(q0*q1 + q2*q3) - my;
+        double H[3][3];
+        jacobianH(x, H);
 
-        double f6 = 2*bx*(q0*q2 + q1*q3)
-                + 2*bz*(0.5 - q1*q1 - q2*q2) - mz;
-        // TÄS LOPPUU GPT
+        double K[3] = {
+            P.p[0][0] / (P.p[0][0] + accelNoise),
+            P.p[1][1] / (P.p[1][1] + accelNoise),
+            P.p[2][2] / (P.p[2][2] + accelNoise)
+        };
 
-        //Gyrö integrointi
-        quaternion qDot = qMul(q, {0, gyroData.x, gyroData.y, gyroData.z});
-        qDot.w *= 0.5;
-        qDot.x *= 0.5;
-        qDot.y *= 0.5;
-        qDot.z *= 0.5;
+        vector3 dtheta = { K[0]*y.x, K[1]*y.y, K[2]*y.z };
+        double theta = sqrt(dtheta.x*dtheta.x + dtheta.y*dtheta.y + dtheta.z*dtheta.z);
 
-        // Accelerometer validity gate aka älä ota iha vittu maisii heilahuskii
-        double accelMag = sqrt(
-            accelData.x*accelData.x +
-            accelData.y*accelData.y +
-            accelData.z*accelData.z
-        );
+        quaternion dq;
+        if(theta < 1e-6) {
+            dq = {1.0, 0.5*dtheta.x, 0.5*dtheta.y, 0.5*dtheta.z};
+        } else {
+            double halfTheta = theta * 0.5;
+            double sinHalf = sin(halfTheta) / theta;
+            dq.w = cos(halfTheta);
+            dq.x = dtheta.x * sinHalf;
+            dq.y = dtheta.y * sinHalf;
+            dq.z = dtheta.z * sinHalf;
+        }
 
+        double gpsYaw;
+        if (!isnan(gpsData.x) && !isnan(gpsData.y)) {
+            double dx = (gpsData.x - lastGPS.x) * LAT_TO_METERS;
+            double dy = (gpsData.y - lastGPS.y) * lonToMeters(gpsData.x);
+            lastGPS = gpsData;
 
-        if (fabs(accelMag - 9.81) < 1.5) {
-            
-            quaternion grad = {0,0,0,0};
+            if (dx != 0 || dy != 0)
+                gpsYaw = atan2(dy, dx);
+            else
+                gpsYaw = previousYaw; // no movement
+        } else {
+            gpsYaw = previousYaw; // jos NaN ei oo gps
+        }
+        double alphaYaw = 0.1;
+        currentYaw = currentYaw + alphaYaw * (gpsYaw - currentYaw);
 
-            // Joku gradient decent
-            double f1 = 2*(q.x*q.z - q.w*q.y) - ax;
-            double f2 = 2*(q.w*q.x + q.y*q.z) - ay;
-            double f3 = 2*(0.5 - q.x*q.x - q.y*q.y) - az;
+        double yawError = gpsYaw - currentYaw;
+        quaternion dq_yaw = { cos(0.5*yawError), 0, 0, sin(0.5*yawError) };
+        x.q = qMul(x.q, dq_yaw);
+        x.q = normalizeQ(x.q);
 
-            // Gradient
-            grad.w =
-                (-2*q2)*f1 + ( 2*q1)*f2
-            + (-2*bz*q2)*f4 + (-2*bx*q3 + 2*bz*q1)*f5 + (2*bx*q2)*f6;
+        if (x.q.w < 0) { x.q.w=-x.q.w; x.q.x=-x.q.x; x.q.y=-x.q.y; x.q.z=-x.q.z; } // untiy quaternion flipperi
 
-            grad.x =
-                ( 2*q3)*f1 + ( 2*q0)*f2 - (4*q1)*f3
-            + (2*bz*q3)*f4 + (2*bx*q2 + 2*bz*q0)*f5
-            + (2*bx*q3 - 4*bz*q1)*f6;
+        for (int i=0; i<3; i++) P.p[i][i] *= (1.0 - K[i]);
+        std::string unityFilePath = "C:/Users/Ninon/AppData/LocalLow/DefaultCompany/gyro/orientation_log.txt";
 
-            grad.y =
-                (-2*q0)*f1 + ( 2*q3)*f2 - (4*q2)*f3
-            + (-4*bx*q2 - 2*bz*q0)*f4
-            + (2*bx*q1 + 2*bz*q3)*f5
-            + (2*bx*q0 - 4*bz*q2)*f6;
-
-            grad.z =
-                ( 2*q1)*f1 + ( 2*q2)*f2
-            + (-4*bx*q3 + 2*bz*q1)*f4
-            + (-2*bx*q0 + 2*bz*q2)*f5
-            + (2*bx*q1)*f6;
-
-
-            // normalisoi gradient
-            double gn = sqrt(
-                grad.w*grad.w +
-                grad.x*grad.x +
-                grad.y*grad.y +
-                grad.z*grad.z
-            );
-            if (gn > 1e-5) {
-                grad.w /= gn;
-                grad.x /= gn;
-                grad.y /= gn;
-                grad.z /= gn;
+        {
+            std::ofstream ofs(unityFilePath, std::ios::trunc);
+            if (ofs.is_open()) {
+                ofs << x.q.w << " "
+                    << x.q.x << " "
+                    << x.q.y << " "
+                    << x.q.z << "\n";
+                ofs.close();
+            } else {
+                std::cerr << "unity onkelma" << std::endl;
             }
         }
-        // qDot korjaus
-        qDot.w -= beta * grad.w;
-        qDot.x -= beta * grad.x;
-        qDot.y -= beta * grad.y;
-        qDot.z -= beta * grad.z;
 
-        // q päivitys
-        q.w += qDot.w * dt;
-        q.x += qDot.x * dt;
-        q.y += qDot.y * dt;
-        q.z += qDot.z * dt;
-
-        fusedOrientation = normalizeQ(q);
-
-        // Eulerit
-        double roll  = atan2(2*(q.w*q.x + q.y*q.z),
-                            1 - 2*(q.x*q.x + q.y*q.y));
-        double pitch = asin(clamp(2*(q.w*q.y - q.z*q.x), -1.0, 1.0)); // Jos menee ohi [-1,1] nii NaN
-        double yaw   = atan2(2*(q.w*q.z + q.x*q.y),
-                            1 - 2*(q.y*q.y + q.z*q.z));
-
-        nextTick += chrono::milliseconds(20);
-        // Laske flight controller
-        flightcontrollerLoop(roll, pitch, yaw);
-        this_thread::sleep_until(nextTick);
+        double roll  = atan2( 2*(x.q.w*x.q.x + x.q.y*x.q.z),
+                            1 - 2*(x.q.x*x.q.x + x.q.y*x.q.y) );
+        double pitch = asin( 2*(x.q.w*x.q.y - x.q.z*x.q.x) );
+        double yaw   = atan2( 2*(x.q.w*x.q.z + x.q.x*x.q.y),
+                            1 - 2*(x.q.y*x.q.y + x.q.z*x.q.z) );
+        flightcontrollerLoop(roll,pitch,yaw);
     }
     return 0;
 }
