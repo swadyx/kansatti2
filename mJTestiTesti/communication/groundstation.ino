@@ -80,48 +80,40 @@ void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
     lastPacketId = receivedTelemetry.packetId;
     packetsReceived++;
     
-    printTelemetry();
+    // Only print every 5th packet (2 Hz display rate)
+    if (packetsReceived % 20 == 0) {
+      printTelemetry();
+    }
   }
 }
 
 void printTelemetry() {
-  // CSV format for logging
-  Serial.printf("TELEM,%lu,%u,%.2f,%.2f,%.2f,%.6f,%.6f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%s,%d,%d\n",
-    receivedTelemetry.timestamp,
-    receivedTelemetry.packetId,
-    receivedTelemetry.altitude,
-    receivedTelemetry.temperature,
-    receivedTelemetry.pressure,
-    receivedTelemetry.latitude,
-    receivedTelemetry.longitude,
-    receivedTelemetry.accelX,
-    receivedTelemetry.accelY,
-    receivedTelemetry.accelZ,
-    receivedTelemetry.gyroX,
-    receivedTelemetry.gyroY,
-    receivedTelemetry.gyroZ,
-    receivedTelemetry.batteryVoltage,
-    getDroneState(receivedTelemetry.droneState),
-    receivedTelemetry.gpsFixQuality,
-    receivedTelemetry.rssi
-  );
+  Serial.println("══════════════════════════════════════════════════════════════════════════════════════════════════════════════");
+  Serial.printf("PKT: %05d | TIME: %8lu ms | STATE: %-10s | BATT: %.2fV | RSSI: %4d dBm | RX: %lu | LOST: %lu (%.1f%%)\n",
+                receivedTelemetry.packetId,
+                receivedTelemetry.timestamp,
+                getDroneState(receivedTelemetry.droneState),
+                receivedTelemetry.batteryVoltage,
+                receivedTelemetry.rssi,
+                packetsReceived,
+                packetsLost,
+                packetsReceived > 0 ? (float)packetsLost / (packetsReceived + packetsLost) * 100 : 0);
   
-  // Human-readable format every 10 packets
-  if (packetsReceived % 10 == 0) {
-    Serial.println("\n--- Telemetry Summary ---");
-    Serial.printf("Packets: %lu received, %lu lost (%.1f%% loss)\n", 
-                  packetsReceived, packetsLost,
-                  packetsReceived > 0 ? (float)packetsLost / (packetsReceived + packetsLost) * 100 : 0);
-    Serial.printf("Altitude: %.2f m | State: %s | Battery: %.2f V\n",
-                  receivedTelemetry.altitude,
-                  getDroneState(receivedTelemetry.droneState),
-                  receivedTelemetry.batteryVoltage);
-    Serial.printf("Position: %.6f, %.6f | RSSI: %d dBm\n",
-                  receivedTelemetry.latitude,
-                  receivedTelemetry.longitude,
-                  receivedTelemetry.rssi);
-    Serial.println("-------------------------\n");
-  }
+  Serial.printf("ALT: %7.2fm | LAT: %11.6f | LON: %11.6f | TEMP: %6.2fC | PRES: %7.2fhPa | GPS: %d\n",
+                receivedTelemetry.altitude,
+                receivedTelemetry.latitude,
+                receivedTelemetry.longitude,
+                receivedTelemetry.temperature,
+                receivedTelemetry.pressure,
+                receivedTelemetry.gpsFixQuality);
+  
+  Serial.printf("ACC: X=%7.2f Y=%7.2f Z=%7.2f m/s² | GYRO: X=%7.2f Y=%7.2f Z=%7.2f °/s\n",
+                receivedTelemetry.accelX,
+                receivedTelemetry.accelY,
+                receivedTelemetry.accelZ,
+                receivedTelemetry.gyroX,
+                receivedTelemetry.gyroY,
+                receivedTelemetry.gyroZ);
 }
 
 void setupESPNow() {
@@ -207,6 +199,10 @@ void setup() {
   delay(1000);
   
   Serial.println("\n=== CanSat Ground Station ===");
+  
+  WiFi.mode(WIFI_STA);
+  delay(100);
+  
   Serial.print("MAC Address: ");
   Serial.println(WiFi.macAddress());
   
