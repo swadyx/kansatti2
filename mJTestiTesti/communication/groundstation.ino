@@ -2,6 +2,8 @@
  * CanSat Ground Station - ESP32-WROOM-U
  * Compatible with ESP32 Arduino Core 3.3.5+ (ESP-IDF 5.5)
  */
+// TODO: RSSI juttu mittaa voimakkuuden signaalin.
+// toinen GS? näytölle telem?
 
 #include <esp_now.h>
 #include <WiFi.h>
