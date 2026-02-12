@@ -17,6 +17,7 @@ double yawFiltered = 0;
 // ================= IMU =================
 float ax, ay, az;
 float gx, gy, gz;
+float ogx, ogy, ogz;
 int16_t temp;
 // ================= GYRO BIAS ===============
 double gyroBiasX=0, gyroBiasY=0, gyroBiasZ=0;
@@ -24,14 +25,25 @@ void calibrateGyro(){
   const int samples = 1000;
   for(int i=0;i<samples;i++){
     bmi088.getGyroscope(&gx,&gy,&gz);
-    gyroBiasX += gx;
-    gyroBiasY += gy;
-    gyroBiasZ += gz;
+
+    float alphaA = 0.01;
+    ogx += alphaA * (gx-ogx);
+    gx=ogx;
+    ogy += alphaA * (gy-ogy);
+    gy=ogy;
+    ogz += alphaA * (gy-ogz);
+    gz=ogz;
+    gyroBiasX +=gx;
+    gyroBiasY +=gy;
+    gyroBiasZ +=gz;
     delay(2);
   }
   gyroBiasX /= samples;
   gyroBiasY /= samples;
   gyroBiasZ /= samples;
+  ogx = 0;
+  ogy = 0;
+  ogz = 0;
 }
 
 // ================= EKF STATE =================
@@ -263,6 +275,9 @@ void loop(){
       quaternionMultiply(cos(0.5*yawError),0,0,sin(0.5*yawError));
       normalizeQuaternion();
     }
+  }else{
+    // Simuloi liikettä nopeuden ja suunnan avulla, 
+    // korjaa aina uudella gps sijainnilla! ehkä joku SIIR joka pitää simulaation ja gps singaalin heiton kurissa 
   }
 
   unsigned long now=millis();
@@ -273,6 +288,16 @@ void loop(){
 
     bmi088.getAcceleration(&ax,&ay,&az);
     bmi088.getGyroscope(&gx,&gy,&gz);
+
+
+    float alphaA = 0.1;
+
+    ogx += alphaA * (gx-ogx);
+    gx=ogx;
+    ogy += alphaA * (gy-ogy);
+    gy=ogy;
+    ogz += alphaA * (gz-ogz);
+    gz=ogz;
 
     gx -= gyroBiasX;
     gy -= gyroBiasY;
@@ -333,6 +358,14 @@ void loop(){
     Serial.print("Roll: ");Serial.print(roll);
     Serial.print(" Pitch: ");Serial.print(pitch);
     Serial.print(" Yaw: ");Serial.println(yaw);
+
+    Serial.print("Gyro X: ");Serial.print(gx);
+    Serial.print(" Gyro Y: ");Serial.print(gy);
+    Serial.print(" Gyro Z: ");Serial.println(gz);
+
+    Serial.print("Gyro Bias X: ");Serial.print(gyroBiasX);
+    Serial.print(" Gyro Bias Y: ");Serial.print(gyroBiasY);
+    Serial.print(" Gyro Bias Z: ");Serial.println(gyroBiasZ);
 
     Serial.print("Motors: ");
     Serial.print(motor1_pwm);Serial.print(" ");
