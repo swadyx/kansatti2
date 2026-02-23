@@ -11,8 +11,14 @@ BMI088 bmi088(BMI088_ACC_ADDRESS, BMI088_GYRO_ADDRESS);
 constexpr float MG_TO_G = 1.0f / 1000.0f;
 unsigned long imuIntervalMs = 20;
 unsigned long lastImuTime = 0;
-double alphaAngle = 0.05;
-
+double alphaAngle = 0.1;
+// ================= AUTOMATIC ACCEL ORIENTATION RACOVERY ================ (todella AI avustettu about 90% koska tää meni jo väsymyksee mut tärkee lisäys)
+bool enableAutoLevelRecovery = true;       // you can turn off for testing
+unsigned long lastStableTime = 0;
+const unsigned long STABLE_TIMEOUT_MS = 800;   
+const float GYRO_STABLE_THRESH_DPS = 15.0;     
+const float ACCEL_NEAR_G_MIN = 0.85;
+const float ACCEL_NEAR_G_MAX = 1.15;
 // ================= FILTER =================
 double rollFiltered = 0;
 double pitchFiltered = 0;
@@ -229,7 +235,8 @@ void calcChecksum(unsigned char* CK){
     CK[1]+=CK[0];
   }
 }
-bool processGPS(){
+bool processGPS(String curState){
+  if (curState == "DEMO") { return false;}
   static int fpos=0;
   static unsigned char checksum[2];
   static uint32_t lastByteTime=0;
@@ -269,7 +276,7 @@ vector3 targetPosition = {0,0,0};
 vector3 currentVelocity = {0,0,0};
 
 double descentVelocitySetpoint = -1.0; // m/s - laskeutumine
-String curState = "DROP"; // DROP --> STABILIZE --> FLIGHT --> LAND
+String curState = "DEMO"; // DROP --> STABILIZE --> FLIGHT --> LAND | DEMO - (vaan stablizise ig)
 
 double xIntegral=0, xLastErr=0;
 double yIntegral=0, yLastErr=0;
@@ -306,7 +313,7 @@ void setup(){
 
 // ================= LOOP =================
 void loop(){
-  if(processGPS()){
+  if(processGPS(curState)){
     double gpsLat = pvt.lat / 10000000.0;
     double gpsLon = pvt.lon / 10000000.0;
     double gpsAlt = pvt.hMSL / 1000.0;
@@ -361,11 +368,86 @@ void loop(){
 
     float gyroNorm = sqrt(gx * gx + gy * gy + gz * gz);
     if (gyroNorm < .5 && fabs(ax) < 0.15f && fabs(ay) < 0.15f && fabs(az+1.0f) < 0.20f) {
-        const float biasAlpha = 0.01;
+        const float biasAlpha = 0.05;
         gyroBiasX += biasAlpha * (gx - gyroBiasX);
         gyroBiasY += biasAlpha * (gy - gyroBiasY);
         gyroBiasZ += biasAlpha * (gz - gyroBiasZ);
     }
+
+        
+      if (enableAutoLevelRecovery) {
+        float gyroMagnitude = sqrt(gx*gx + gy*gy + gz*gz);  // dps
+        float accelMagnitude = sqrt(ax*ax + ay*ay + az*az) * MG_TO_G;  // already in g after bias subtract
+
+        bool isStable =
+          (gyroMagnitude < GYRO_STABLE_THRESH_DPS) &&
+          (accelMagnitude > ACCEL_NEAR_G_MIN && accelMagnitude < ACCEL_NEAR_G_MAX);
+
+        if (isStable) {
+          if (lastStableTime == 0) {
+            lastStableTime = millis();
+          }
+
+          unsigned long stableDuration = millis() - lastStableTime;
+          if (stableDuration >= STABLE_TIMEOUT_MS) {
+            // We have been stable long enough → snap roll & pitch to gravity
+
+            // Measured gravity direction (normalized, in body frame)
+            float norm = sqrt(ax*ax + ay*ay + az*az);
+            if (norm > 1e-6) {
+              float nx = ax / norm;
+              float ny = ay / norm;
+              float nz = az / norm;
+
+              // We assume target: gravity in body = (0, 0, +1) or (0,0,-1) depending on coord system
+              // Your code seems to expect az ≈ +1 when level (check your hz = -(...) expression)
+
+              // Simple way: compute quaternion that rotates current gravity vector to (0,0,1)
+              // Vector to align: current gravity dir → (0,0,1)
+
+              // Cross product gives rotation axis
+              float vx = ny * 1.0 - nz * 0.0;   // ny*1 - nz*0
+              float vy = nz * 0.0 - nx * 1.0;
+              float vz = nx * 0.0 - ny * 0.0;
+
+              float crossMag = sqrt(vx*vx + vy*vy + vz*vz);
+              float dot = nz;  // cos(angle) = dot product with (0,0,1)
+
+              if (crossMag < 1e-5) {
+                // Already almost aligned → do nothing or small yaw preserve
+                // but we can still reset if wanted
+              } else {
+                float angle = acos(constrain(dot, -1.0f, 1.0f));
+                float halfAngle = angle * 0.5f;
+                float s = sin(halfAngle);
+
+                // Axis-angle → quaternion
+                float qw = cos(halfAngle);
+                float qx = vx / crossMag * s;
+                float qy = vy / crossMag * s;
+                float qz = vz / crossMag * s;
+
+                // Apply this rotation → this snaps tilt, preserves yaw-ish
+                quaternionMultiply(qw, qx, qy, qz);
+                normalizeQuaternion();
+
+                // Optional: reset covariances so filter trusts new state
+                P0 = 0.1;
+                P1 = 0.1;
+                P2 = 3.0;   // keep yaw uncertain
+
+                Serial.println("AUTO-LEVEL RECOVERY SNAP PERFORMED");
+              }
+            }
+
+            // Reset timer so we don't snap every loop
+            lastStableTime = 0;
+          }
+        } else {
+          // Not stable anymore → reset timer
+          lastStableTime = 0;
+        }
+      }
 
     ekfPredict(gx*DEG_TO_RAD,
                gy*DEG_TO_RAD,
@@ -405,7 +487,7 @@ void loop(){
     } else {
       double rollSet = 0.0;
       double pitchSet = 0.0;
-      double yawSet = 0.0;
+      double yawSet = (curState == "DEMO") ? yaw : 0.0;
       if (curState == "FLIGHT") {
         double xOut = pidUpdate(measuredPos.x, targetPosition.x, 0.2, 0.0, 0.01, xIntegral, xLastErr);
         double yOut = pidUpdate(measuredPos.y, targetPosition.y, 0.2, 0.0, 0.01, yIntegral, yLastErr);
@@ -457,15 +539,17 @@ void loop(){
           curState = "LANDED"; 
         }
       }
-      double velErrorZ = desiredVelZ - currentVelocity.z;
-      double thrustAdjust = pidUpdate(velErrorZ, 0.0, 0.25, 0.12, 0.04, zVelIntegral, zVelLastErr);
-      thrust = hoverThrust + thrustAdjust;
+      if (curState != "DEMO") {
+        double velErrorZ = desiredVelZ - currentVelocity.z;
+        double thrustAdjust = pidUpdate(velErrorZ, 0.0, 0.25, 0.12, 0.04, zVelIntegral, zVelLastErr);
+        thrust = hoverThrust + thrustAdjust;
 
-      double tilt = sqrt(roll*roll + pitch*pitch);
-      if (cos(tilt) > 0.01) {
-        thrust /= cos(tilt);
-      }
-      thrust = constrain(thrust, 0.0, 0.65);
+        double tilt = sqrt(roll*roll + pitch*pitch);
+        if (cos(tilt) > 0.01) {
+          thrust /= cos(tilt);
+        }
+        thrust = constrain(thrust, 0.0, 0.65);
+      }else {thrust = hoverThrust; }
     }
     // Motor mixing
     double m1=thrust-rollOut+pitchOut+yawOut;
