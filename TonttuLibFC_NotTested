@@ -2,6 +2,8 @@
 #include <avr/pgmspace.h>
 #include <Tonttulib.h>
 
+Tonttulib tLib;
+
 #define GPS_BYTE_TIMEOUT_MS 250
 #define PI 3.141592653589793
 #define DEG_TO_RAD (PI / 180.0)
@@ -34,8 +36,7 @@ void calibrateAccel() {
   double sumAx=0, sumAy=0, sumAz=0;
   const int samples = 3000;
   for(int i=0; i<samples; i++){
-    tLib.imu.readAccel(ax, ay, az)
-    ax *= MG_TO_G; ay *= MG_TO_G; az *= MG_TO_G;
+    tLib.imu.readAccel(ax, ay, az) // in g
     sumAx += ax;
     sumAy += ay;
     sumAz += az;
@@ -51,7 +52,7 @@ double gyroBiasX=0, gyroBiasY=0, gyroBiasZ=0;
 void calibrateGyro(){
   const int samples = 3000;
   for(int i=0;i<samples;i++){
-    tLib.imu.readGyro(gx, gy, gz)
+    tLib.imu.readGyro(gx, gy, gz);
     float alphaA = 0.2;
     ogx += alphaA * (gx-ogx);
     gx=ogx;
@@ -230,6 +231,22 @@ void setup(){
   Serial.println("All sensors initialized!");
   calibrateGyro();
   calibrateAccel();
+
+    // // --- Motors ---
+  tLib.motors.set(1, 2000);
+  tLib.motors.set(2, 2000);
+  tLib.motors.set(3, 2000);
+  tLib.motors.set(4, 2000);
+
+  delay(10000); // give ESCs time to arm
+
+  tLib.motors.set(1, 1000);
+  tLib.motors.set(2, 1000);
+  tLib.motors.set(3, 1000);
+  tLib.motors.set(4, 1000);
+
+  delay(10000); // give ESCs time to arm
+
   thrust = 0.0; // Start with no thrust in DROP
   stateStartTime = millis();
 }
@@ -305,8 +322,8 @@ void loop(){
     double dt=0.02;
     lastImuTime=now;
 
-    tLib.imu.readAccel(ax, ay, az)
-    tLib.imu.readGyro(gx, gy, gz)
+    tLib.imu.readAccel(ax, ay, az);
+    tLib.imu.readGyro(gx, gy, gz);
 
     ax*=MG_TO_G; ay*=MG_TO_G; az*=MG_TO_G;
     ax -= accelBiasX;
