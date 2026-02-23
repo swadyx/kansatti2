@@ -509,6 +509,11 @@ void loop(){
     motor3_pwm=constrain(m3*1000+1000,1000,2000);
     motor4_pwm=constrain(m4*1000+1000,1000,2000);
 
+    tLib.motors.set(1, motor1_pwm);
+    tLib.motors.set(2, motor2_pwm);
+    tLib.motors.set(3, motor3_pwm);
+    tLib.motors.set(4, motor4_pwm);
+
     tLib.update();
     // Debug prints
     Serial.print("State: "); Serial.println(curState);
