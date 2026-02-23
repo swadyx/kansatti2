@@ -7,10 +7,10 @@
 #include <WiFi.h>
 #include "esp_wifi.h"
 
-// Drone MAC
+// Drone mac
 uint8_t droneMAC[] = {0x98, 0xA3, 0x16, 0xF8, 0x27, 0x40};
 
-// ===== MUST MATCH DRONE STRUCTS EXACTLY =====
+// pitää olla sama ku dronen lähettämä paketti
 typedef struct __attribute__((packed)) {
   uint32_t timestamp;
   uint8_t  packetType;
@@ -32,7 +32,7 @@ typedef struct __attribute__((packed)) {
 } TelemetryPacket;
 
 typedef struct __attribute__((packed)) {
-  uint8_t  packetType;     // 0x10
+  uint8_t  packetType;     // 0x10 emt mikä tää on en väitä vastaan claudelle
   uint8_t  commandType;
   uint8_t  param1;
   uint8_t  param2;
@@ -47,8 +47,7 @@ uint16_t lastPacketId = 0;
 unsigned long lastPacketTime = 0;
 int8_t lastRssi = 0;
 bool peerAdded = false;
-
-// ===== STATE NAME =====
+// eri statet
 const char* stateName(uint8_t s) {
   switch (s) {
     case 0: return "OFF";
@@ -60,7 +59,6 @@ const char* stateName(uint8_t s) {
   }
 }
 
-// ===== CALLBACKS =====
 void onDataSent(const wifi_tx_info_t *tx_info, esp_now_send_status_t status) {
   Serial.printf("[TX] %s\n", status == ESP_NOW_SEND_SUCCESS ? "Delivered" : "FAILED");
 }
@@ -72,14 +70,13 @@ void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
   if (len == sizeof(TelemetryPacket) && data[4] == 0x01) {
     memcpy(&telem, data, sizeof(telem));
 
-    // Packet loss tracking
+    // träkätää et onko paketteja kadonnu matkalla :D
     if (packetsReceived > 0 && telem.packetId > lastPacketId + 1) {
       packetsLost += (telem.packetId - lastPacketId - 1);
     }
     lastPacketId = telem.packetId;
     packetsReceived++;
-
-    // Print every 4th packet (0.5 Hz display)
+// joka neljäs paketti printataa atm
     if (packetsReceived % 4 == 0) {
       printTelemetry();
     }
@@ -89,7 +86,7 @@ void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
 void printTelemetry() {
   float loss = (packetsReceived + packetsLost) > 0 
     ? (float)packetsLost / (packetsReceived + packetsLost) * 100.0 : 0;
-
+// pimee chart joka printataa
   Serial.println("═══════════════════════════════════════════════════════════════════");
   Serial.printf("PKT:%05d | T:%8lums | %-10s | RSSI:%4ddBm | LOSS:%.1f%% | RX:%lu\n",
     telem.packetId, telem.timestamp, stateName(telem.droneState),
@@ -105,7 +102,7 @@ void printTelemetry() {
     telem.sdOK ? "OK" : "X", telem.camOK ? "OK" : "X");
 }
 
-// ===== SEND COMMAND =====
+// commandie lähettämine tätä pitää työstää viel paremmaks
 void sendCommand(uint8_t cmdType, uint8_t p1, uint8_t p2) {
   if (!peerAdded) { Serial.println("[ERR] No peer"); return; }
 
@@ -120,11 +117,10 @@ void sendCommand(uint8_t cmdType, uint8_t p1, uint8_t p2) {
   Serial.printf("[TX] Command 0x%02X p1=%d p2=%d\n", cmdType, p1, p2);
 }
 
-// ===== SEND TEXT MESSAGE =====
+// poista enne lentoo tää on paskane debug juttu et voidaa lähettää perus viestejä
 void sendMessage(const char *msg) {
   if (!peerAdded) { Serial.println("[ERR] No peer"); return; }
 
-  // Build packet: [0x20][string bytes]
   int msgLen = strlen(msg);
   if (msgLen > 199) msgLen = 199;
 
@@ -137,7 +133,7 @@ void sendMessage(const char *msg) {
   Serial.printf("[TX] Message: \"%s\"\n", msg);
 }
 
-// ===== ESP-NOW SETUP =====
+// fifi päälle
 void setupESPNow() {
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
@@ -160,7 +156,6 @@ void setupESPNow() {
   Serial.printf("[ESP-NOW] Peer: %s\n", peerAdded ? "OK" : "FAIL");
 }
 
-// ===== SERIAL COMMAND PARSER =====
 void processSerial() {
   if (!Serial.available()) return;
 
@@ -168,7 +163,7 @@ void processSerial() {
   input.trim();
   if (input.length() == 0) return;
 
-  // Commands (start with /)
+  // komennot alkaa / merkillä esim /off /pause /on /test
   if (input.startsWith("/")) {
     String cmd = input.substring(1);
 
@@ -185,7 +180,8 @@ void processSerial() {
       sendCommand(0x04, 0, 0);
     }
     else if (cmd.startsWith("motor ")) {
-      // /motor 1 50  →  motor 1 at 50%
+      // /motor 1 50  →  mootori 1 on  50% päällä joku pimee pitää poistaa ainaki enne lentoo ettei käy incident
+      // pimeet gpt jutut ei oikee onnistunu iteltä
       int space = cmd.indexOf(' ', 6);
       if (space > 0) {
         int motor = cmd.substring(6, space).toInt();
@@ -224,7 +220,6 @@ void processSerial() {
   }
 }
 
-// ===== SETUP =====
 void setup() {
   Serial.begin(115200);
   delay(1000);
@@ -244,11 +239,11 @@ void setup() {
 void loop() {
   processSerial();
 
-  // Warn if no data
+// tulee warning jos dataloss tai connectionerror
   if (packetsReceived > 0 && millis() - lastPacketTime > 5000) {
     Serial.println("[WARN] No telemetry for 5 seconds");
     lastPacketTime = millis();
   }
 
-  delay(10);
+  delay(10); // ettei stuckaa jos full loop
 }
