@@ -13,8 +13,7 @@
 #include "esp_camera.h"
 #include "FS.h"
 #include "SD_MMC.h"
-
-// ===== CAMERA PINS (XIAO ESP32S3 Sense) =====
+//kameran jotku paskat source: trust me vro
 #define PWDN_GPIO_NUM    -1
 #define RESET_GPIO_NUM   -1
 #define XCLK_GPIO_NUM    10
@@ -31,11 +30,10 @@
 #define VSYNC_GPIO_NUM   38
 #define HREF_GPIO_NUM    47
 #define PCLK_GPIO_NUM    13
-
-// ===== GROUND STATION MAC =====
+//toisen osan macci
 uint8_t groundStationMAC[] = {0xD4, 0xD4, 0xDA, 0x5A, 0x5A, 0x74};
 
-// ===== DRONE STATES =====
+//pimeet gpt jutut
 enum DroneState : uint8_t {
   STATE_OFF     = 0,
   STATE_IDLE    = 1,   // powered on, waiting
@@ -43,8 +41,7 @@ enum DroneState : uint8_t {
   STATE_PAUSED  = 3,
   STATE_MOTOR_TEST = 4
 };
-
-// ===== TELEMETRY STRUCT (sent to GS) =====
+// nää lähtee datana
 typedef struct __attribute__((packed)) {
   uint32_t timestamp;
   uint8_t  packetType;     // 0x01 = telemetry
@@ -64,7 +61,7 @@ typedef struct __attribute__((packed)) {
   uint8_t  sdOK;
   uint8_t  camOK;
 } TelemetryPacket;
-
+// full GPT mode on en tiiä mikä tää on
 // ===== COMMAND STRUCT (from GS) =====
 // packetType 0x10 = command
 typedef struct __attribute__((packed)) {
@@ -137,24 +134,19 @@ void stopCamera() {
   esp_camera_deinit();
 }
 
-// ============================================================
-//  SD CARD (time-shared with camera)
-// ============================================================
+// laitetaa sd päälle jos ei nii tulee error siihe
 bool mountSD() {
   SD_MMC.setPins(7, 9, 8);
   if (!SD_MMC.begin("/sdcard", true)) return false;
   sdMounted = true;
   return true;
 }
-
+// pois päält
 void unmountSD() {
   SD_MMC.end();
   sdMounted = false;
 }
-
-// ============================================================
-//  ESP-NOW CALLBACKS
-// ============================================================
+// espi data sent ja received
 void onDataSent(const wifi_tx_info_t *tx_info, esp_now_send_status_t status) {}
 
 void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
@@ -177,9 +169,7 @@ void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
   }
 }
 
-// ============================================================
-//  ESP-NOW SETUP
-// ============================================================
+// wifi setuppi
 bool peerAdded = false;
 
 void setupESPNow() {
@@ -204,9 +194,7 @@ void setupESPNow() {
   Serial.printf("[ESP-NOW] Peer: %s\n", peerAdded ? "OK" : "FAIL");
 }
 
-// ============================================================
-//  COMMAND HANDLER
-// ============================================================
+// tätä pitää jatkaa händlää ne wifin yli tulevat commandid kute vaik launch pause on off yms
 void handleCommand(CommandPacket &cmd) {
   Serial.printf("[CMD] type=0x%02X p1=%d p2=%d\n", cmd.commandType, cmd.param1, cmd.param2);
 
@@ -251,11 +239,10 @@ void taskSendTelemetry() {
   telemetry.packetType     = 0x01;
   telemetry.packetId       = packetCounter++;
   telemetry.droneState     = (uint8_t)currentState;
-  telemetry.photoCount     = photoCounter;
-  telemetry.sdOK           = sdMounted ? 1 : 0;
+  telemetry.photoCount     = photoCounter; // aika turha tuski tarvitaa amount of kuvat se on len(kuvat on sd)
+  telemetry.sdOK           = sdMounted ? 1 : 0; // pliis toimi
   telemetry.camOK          = 1;  // we know it works from test
-
-  // TODO: fill with real sensor data
+// tähä kerätää oikeet datat, voi muokata viel
   telemetry.altitude       = 0.0;
   telemetry.temperature    = 25.0;
   telemetry.pressure       = 1013.25;
@@ -276,14 +263,12 @@ void taskSendTelemetry() {
   }
 }
 
-// ============================================================
-//  TASK 2: TAKE PHOTO (skip on error)
-// ============================================================
+// joo täs sanotaa muikku ja otetaa se hall of fame kuva
 // Returns pointer + length. Caller must free the buffer.
 uint8_t *capturePhoto(size_t &outLen) {
   outLen = 0;
 
-  // Unmount SD first (free pins 38/39/40)
+  // Unmount SD first (free pins 38/39/40) koska niil tulee riitaa muuten emt vähä pimee
   if (sdMounted) unmountSD();
   delay(10);
 
@@ -296,7 +281,7 @@ uint8_t *capturePhoto(size_t &outLen) {
   camera_fb_t *fb = esp_camera_fb_get();
   if (fb) esp_camera_fb_return(fb);
 
-  // Real capture
+  // Real capture emt miks näinki mut en väitä vastaan
   fb = esp_camera_fb_get();
   if (!fb) {
     Serial.println("[CAM] Capture failed — skipping");
@@ -321,9 +306,8 @@ uint8_t *capturePhoto(size_t &outLen) {
   return buf;
 }
 
-// ============================================================
 //  TASK 3: WRITE TO SD (skip on error)
-// ============================================================
+// voi skippaa kosk joskus erroreita ja ei haluta et stuckkaa siihe
 void taskWriteSD(uint8_t *imgBuf, size_t imgLen) {
   if (!mountSD()) {
     Serial.println("[SD] Mount failed — skipping write");
@@ -365,16 +349,12 @@ void taskWriteSD(uint8_t *imgBuf, size_t imgLen) {
   }
 }
 
-// ============================================================
-//  SETUP
-// ============================================================
+//  main setup
 void setup() {
   Serial.begin(115200);
   delay(1500);
 
-  Serial.println("\n============================");
-  Serial.println("  CANSAT DRONE v2.0");
-  Serial.println("============================");
+  Serial.println("poks DRoNE v2.71");
   Serial.printf("PSRAM: %s (%d bytes)\n", psramFound() ? "YES" : "NO!", ESP.getPsramSize());
   Serial.printf("MAC:   %s\n", WiFi.macAddress().c_str());
 
@@ -397,9 +377,8 @@ void setup() {
   Serial.println("\n[READY] Waiting for commands...\n");
 }
 
-// ============================================================
+
 //  LOOP
-// ============================================================
 void loop() {
   unsigned long now = millis();
 
@@ -410,34 +389,31 @@ void loop() {
   }
 
   // --- Handle incoming text message (from callback) ---
+  // messaget on debukkausta varte
   if (messagePending) {
     messagePending = false;
     Serial.printf("[MSG FROM GS] %s\n", pendingMessage);
   }
 
   // --- PRIORITY 1: Send telemetry at 2 Hz ---
+  // prioriteetti: lähetä dataa --> ota kuva --> kirjota sd
   if (now - lastSendTime >= SEND_INTERVAL_MS) {
     lastSendTime = now;
     taskSendTelemetry();
   }
 
-  // --- If OFF or PAUSED, skip photo & SD tasks ---
   if (currentState == STATE_OFF || currentState == STATE_PAUSED) {
     return;
   }
 
-  // --- PRIORITY 2 & 3: Photo + SD write every 3s ---
   if (now - lastPhotoTime >= PHOTO_INTERVAL_MS) {
     lastPhotoTime = now;
 
-    // Task 2: capture photo (returns buffer or nullptr on error)
     size_t imgLen = 0;
     uint8_t *imgBuf = capturePhoto(imgLen);
 
-    // Task 3: write to SD (photo + CSV)
-    taskWriteSD(imgBuf, imgLen);
-
-    // Free the image buffer
+    taskWriteSD(imgBuf, imgLen); // kirjotetaa kortille
+//emt mitä tää tekee
     if (imgBuf) free(imgBuf);
   }
 }
