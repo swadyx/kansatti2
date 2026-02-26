@@ -1,0 +1,385 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <avr/pgmspace.h>
+#include <Tonttulib.h>
+
+Tonttulib tLib;
+
+// ===================== USER SETTINGS =====================
+static constexpr uint32_t TELEMETRY_PERIOD_MS = 500;   // 2 Hz
+
+// thrust control
+static constexpr float THRUST_STEP = 0.02f;  // per command
+static constexpr float THRUST_MIN  = 0.00f;
+static constexpr float THRUST_MAX  = 0.90f;  // safety cap
+
+static float baseThrust = 0.45f;
+static bool motorsArmed = false; // FALSE by default
+
+// ===================== Helpers =====================
+static inline int16_t clamp_i16(int32_t v) {
+  if (v < -32768) return -32768;
+  if (v >  32767) return  32767;
+  return (int16_t)v;
+}
+static inline uint16_t clamp_u16(int32_t v) {
+  if (v < 0) return 0;
+  if (v > 65535) return 65535;
+  return (uint16_t)v;
+}
+static inline float clamp_f(float x, float lo, float hi) {
+  if (x < lo) return lo;
+  if (x > hi) return hi;
+  return x;
+}
+
+// ===================== Motors =====================
+static void motorsSetAll(uint16_t us) {
+  tLib.motors.set(1, us);
+  tLib.motors.set(2, us);
+  tLib.motors.set(3, us);
+  tLib.motors.set(4, us);
+}
+
+static uint16_t m1_cmd_us = 1000, m2_cmd_us = 1000, m3_cmd_us = 1000, m4_cmd_us = 1000;
+
+// ===================== Sensors / EKF (acc in g, gyro in dps) =====================
+static float ax=0, ay=0, az=0;
+static float gx=0, gy=0, gz=0;
+
+static float ax_g=0, ay_g=0, az_g=0;
+static float gx_dps=0, gy_dps=0, gz_dps=0;
+
+// accel bias (in g)
+static double accelBiasX=0, accelBiasY=0, accelBiasZ=0;
+
+// gyro bias (in dps)
+static double gyroBiasX=0, gyroBiasY=0, gyroBiasZ=0;
+
+// low-pass for gyro raw during calibration
+static float ogx=0, ogy=0, ogz=0;
+
+// EKF quaternion + covariance scalars
+static double q0=1, q1=0, q2=0, q3=0;
+static double P0=3, P1=3, P2=3;
+static double accelNoise=0.1;
+static double gyroNoise=0.001;
+
+// filtered angles (radians internally)
+static double alphaAngle = 0.1;
+static double rollFiltered = 0;
+static double pitchFiltered = 0;
+static double yawFiltered = 0;
+
+// exported angles for telemetry (degrees)
+static float roll_deg=0, pitch_deg=0, yaw_deg=0;
+
+// IMU timing
+static uint32_t lastImuUs = 0;
+static constexpr uint32_t IMU_PERIOD_US = 5000;
+
+// --- EKF helpers ---
+static void normalizeQuaternion() {
+  double n = sqrt(q0*q0 + q1*q1 + q2*q2 + q3*q3);
+  if (n < 1e-9) { q0=1; q1=q2=q3=0; return; }
+  q0/=n; q1/=n; q2/=n; q3/=n;
+}
+
+static void quaternionMultiply(double w, double x, double y, double z){
+  double nw=q0*w - q1*x - q2*y - q3*z;
+  double nx=q0*x + q1*w + q2*z - q3*y;
+  double ny=q0*y - q1*z + q2*w + q3*x;
+  double nz=q0*z + q1*y - q2*x + q3*w;
+  q0=nw; q1=nx; q2=ny; q3=nz;
+}
+
+static void ekfPredict(double gx_rad, double gy_rad, double gz_rad, double dt){
+  double dq0=0.5*(-q1*gx_rad - q2*gy_rad - q3*gz_rad);
+  double dq1=0.5*( q0*gx_rad + q2*gz_rad - q3*gy_rad);
+  double dq2=0.5*( q0*gy_rad - q1*gz_rad + q3*gx_rad);
+  double dq3=0.5*( q0*gz_rad + q1*gy_rad - q2*gx_rad);
+  q0+=dq0*dt; q1+=dq1*dt; q2+=dq2*dt; q3+=dq3*dt;
+  normalizeQuaternion();
+  double qNoiseRoll = gyroNoise * gyroNoise * dt;
+  P0 += qNoiseRoll;
+  P1 += qNoiseRoll;
+  P2 += qNoiseRoll * 4.0;
+}
+
+static void ekfUpdateAccel(double ax_g_in, double ay_g_in, double az_g_in){
+  double norm = sqrt(ax_g_in*ax_g_in + ay_g_in*ay_g_in + az_g_in*az_g_in);
+  if(norm < 1e-6) return;
+  if(fabs(norm - 1.0) > 0.2) return;
+
+  double axn=ax_g_in/norm, ayn=ay_g_in/norm;
+
+  double hx = -2*(q1*q3 + q0*q2);
+  double hy = -2*(q2*q3 - q0*q1);
+
+  double K0 = P0 / (P0 + accelNoise);
+  double K1 = P1 / (P1 + accelNoise);
+
+  double dX = K0 * (ayn - hy);
+  double dY = K1 * (-(axn - hx));
+
+  double theta = sqrt(dX*dX + dY*dY);
+  double dq_w, dq_x, dq_y, dq_z;
+  if(theta < 1e-6){
+    dq_w=1; dq_x=0.5*dX; dq_y=0.5*dY; dq_z=0;
+  } else {
+    double halfTheta = theta * 0.5;
+    double sinHalf = sin(halfTheta) / theta;
+    dq_w = cos(halfTheta);
+    dq_x = dX * sinHalf;
+    dq_y = dY * sinHalf;
+    dq_z = 0;
+  }
+
+  quaternionMultiply(dq_w, dq_x, dq_y, dq_z);
+  normalizeQuaternion();
+
+  P0 *= (1.0 - K0);
+  P1 *= (1.0 - K1);
+}
+
+// EKF + filtered Euler output update
+static void sensorStep(uint32_t nowUs){
+  if ((int32_t)(nowUs - lastImuUs) < (int32_t)IMU_PERIOD_US) return;
+
+  const uint32_t prevUs = lastImuUs;
+  lastImuUs = nowUs;
+
+  double dt = (nowUs - prevUs) * 1e-6;
+  if (dt <= 0.0 || dt > 0.1) dt = 0.005;
+
+  tLib.imu.readAccel(ax, ay, az); // g
+  tLib.imu.readGyro(gx, gy, gz);  // dps
+
+  ax_g = ax - (float)accelBiasX;
+  ay_g = ay - (float)accelBiasY;
+  az_g = az - (float)accelBiasZ;
+
+  float gyroMag = sqrtf(gx*gx + gy*gy + gz*gz);
+  if(gyroMag < 0.5f && fabsf(ax_g) < 0.15f && fabsf(ay_g) < 0.15f && fabsf(az_g - 1.0f) < 0.20f){
+    const float biasAlpha = 0.05f;
+    gyroBiasX += biasAlpha * (gx - gyroBiasX);
+    gyroBiasY += biasAlpha * (gy - gyroBiasY);
+    gyroBiasZ += biasAlpha * (gz - gyroBiasZ);
+  }
+
+  gx_dps = gx - (float)gyroBiasX;
+  gy_dps = gy - (float)gyroBiasY;
+  gz_dps = gz - (float)gyroBiasZ;
+
+  ekfPredict(gx_dps * DEG_TO_RAD, gy_dps * DEG_TO_RAD, gz_dps * DEG_TO_RAD, dt);
+  ekfUpdateAccel(ax_g, ay_g, az_g);
+
+  double roll  = atan2(2*(q0*q1 + q2*q3), 1 - 2*(q1*q1 + q2*q2));
+  double pitch = asin(2*(q0*q2 - q3*q1));
+  double yaw   = atan2(2*(q0*q3 + q1*q2), 1 - 2*(q2*q2 + q3*q3));
+
+  rollFiltered  += alphaAngle * (roll  - rollFiltered);
+  pitchFiltered += alphaAngle * (pitch - pitchFiltered);
+  yawFiltered   += alphaAngle * (yaw   - yawFiltered);
+
+  roll_deg  = (float)(rollFiltered  * (180.0 / PI));
+  pitch_deg = (float)(pitchFiltered * (180.0 / PI));
+  yaw_deg   = (float)(yawFiltered   * (180.0 / PI));
+}
+
+// ===================== Serial command input =====================
+static char cmdBuf[64];
+static uint8_t cmdLen = 0;
+
+static void handleCmdLine(char* s) {
+  // lower-case in place
+  for (char* p=s; *p; ++p) *p = (char)tolower(*p);
+
+  if (strcmp(s, "fly") == 0) {
+    motorsArmed = true;
+    Serial.println("[AIR] MOTORS ARMED (fly)");
+    return;
+  }
+  if (strcmp(s, "stop") == 0) {
+    motorsArmed = false;
+    baseThrust = 0.0f;
+    motorsSetAll(1000);
+    Serial.println("[AIR] MOTORS DISARMED + STOP");
+    return;
+  }
+  if (strcmp(s, "up") == 0) {
+    baseThrust = clamp_f(baseThrust + THRUST_STEP, THRUST_MIN, THRUST_MAX);
+    Serial.print("[AIR] baseThrust up -> "); Serial.println(baseThrust, 3);
+    return;
+  }
+  if (strcmp(s, "down") == 0) {
+    baseThrust = clamp_f(baseThrust - THRUST_STEP, THRUST_MIN, THRUST_MAX);
+    Serial.print("[AIR] baseThrust down -> "); Serial.println(baseThrust, 3);
+    return;
+  }
+
+  if (strcmp(s, "led on") == 0)   { tLib.led.on();        Serial.println("[AIR] LED on"); return; }
+  if (strcmp(s, "led off") == 0)  { tLib.led.off();       Serial.println("[AIR] LED off"); return; }
+  if (strcmp(s, "led fast") == 0) { tLib.led.blinkFast(); Serial.println("[AIR] LED fast"); return; }
+  if (strcmp(s, "led slow") == 0) { tLib.led.blinkSlow(); Serial.println("[AIR] LED slow"); return; }
+
+  Serial.print("[AIR] Unknown cmd: ");
+  Serial.println(s);
+}
+
+static void pollUsbSerialCmds() {
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\r') continue;
+    if (c == '\n') {
+      cmdBuf[cmdLen] = 0;
+      if (cmdLen > 0) handleCmdLine(cmdBuf);
+      cmdLen = 0;
+    } else {
+      if (cmdLen + 1 < sizeof(cmdBuf)) cmdBuf[cmdLen++] = c;
+    }
+  }
+}
+
+// ===================== Telemetry printing =====================
+static uint8_t telemSeq = 0;
+static uint32_t nextTelemMs = 0;
+
+static void printTelemetryLine() {
+  const uint8_t seq = telemSeq++;
+
+  // raw values already in normal units:
+  // ax_g,ay_g,az_g  -> g
+  // gx_dps,gy_dps,gz_dps -> deg/s
+  // roll_deg,pitch_deg,yaw_deg -> deg
+  const float lipo_V = tLib.vlipo.readVoltage();  // V
+  const float thrust = baseThrust;                // 0..1
+
+  // Optional: print header once
+  static bool headerPrinted = false;
+  if (!headerPrinted) {
+    headerPrinted = true;
+    Serial.println("T,seq,ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps,roll_deg,pitch_deg,yaw_deg,lipo_V,thrust,m1_us,m2_us,m3_us,m4_us");
+  }
+
+  Serial.print("T,");
+  Serial.print(seq); Serial.print(",");
+
+  Serial.print(ax_g, 4); Serial.print(",");
+  Serial.print(ay_g, 4); Serial.print(",");
+  Serial.print(az_g, 4); Serial.print(",");
+
+  Serial.print(gx_dps, 3); Serial.print(",");
+  Serial.print(gy_dps, 3); Serial.print(",");
+  Serial.print(gz_dps, 3); Serial.print(",");
+
+  Serial.print(roll_deg, 2);  Serial.print(",");
+  Serial.print(pitch_deg, 2); Serial.print(",");
+  Serial.print(yaw_deg, 2);   Serial.print(",");
+
+  Serial.print(lipo_V, 3); Serial.print(",");
+  Serial.print(thrust, 3); Serial.print(",");
+
+  Serial.print(m1_cmd_us); Serial.print(",");
+  Serial.print(m2_cmd_us); Serial.print(",");
+  Serial.print(m3_cmd_us); Serial.print(",");
+  Serial.println(m4_cmd_us);
+}
+
+// ===================== Setup / loop =====================
+void setup() {
+  Wire.begin();
+  Serial.begin(115200);
+  delay(200);
+
+  Serial.println("[AIR] Boot (NO LORA)");
+
+  int status = tLib.init();
+  if (status != 1) {
+    Serial.print("[AIR] Tonttulib init failed code: ");
+    Serial.println(status);
+    while (true) {}
+  }
+
+  tLib.led.off();
+  motorsSetAll(1000); // safe
+
+  lastImuUs = micros();
+  nextTelemMs = millis() + TELEMETRY_PERIOD_MS;
+
+  Serial.println("[AIR] Ready. Commands: fly, stop, up, down, led on/off/fast/slow");
+}
+
+void loop() {
+  const uint32_t nowMs = millis();
+  const uint32_t nowUs = micros();
+
+  tLib.update();
+
+  pollUsbSerialCmds();
+
+  // sensor update
+  sensorStep(nowUs);
+
+  // ===================== Attitude PID + mixing (your style) =====================
+  static double rollIntegral=0, pitchIntegral=0, yawIntegral=0;
+  static double rollLastErr=0, pitchLastErr=0, yawLastErr=0;
+
+  auto pidUpdate = [&](double input, double setpoint,
+                       double kp, double ki, double kd,
+                       double &integral, double &lastErr, double dt) -> double {
+    double err = setpoint - input;
+    integral += err * dt;
+    integral = constrain(integral, -0.3, 0.3);
+    double derivative = (dt > 1e-6) ? (err - lastErr) / dt : 0.0;
+    lastErr = err;
+    return kp*err + ki*integral + kd*derivative;
+  };
+
+  static uint32_t lastPidUs = 0;
+  if (lastPidUs == 0) lastPidUs = nowUs;
+  double dtPid = (nowUs - lastPidUs) * 1e-6;
+  lastPidUs = nowUs;
+  if (dtPid <= 0.0 || dtPid > 0.1) dtPid = 0.005;
+
+  double roll  = roll_deg  * (PI / 180.0);
+  double pitch = pitch_deg * (PI / 180.0);
+  double yaw   = yaw_deg   * (PI / 180.0);
+
+  static double yawSetpoint = 0.0;
+  static bool yawInit = false;
+  if (!yawInit) { yawSetpoint = yaw; yawInit = true; }
+
+  double rollOut  = pidUpdate(roll,  0.0,         0.05, 0.002, 0.001, rollIntegral,  rollLastErr,  dtPid);
+  double pitchOut = pidUpdate(pitch, 0.0,         0.05, 0.002, 0.001, pitchIntegral, pitchLastErr, dtPid);
+  double yawOut   = pidUpdate(yaw,   yawSetpoint, 0.05, 0.002, 0.001, yawIntegral,   yawLastErr,   dtPid);
+
+  rollOut  = constrain(rollOut,  -0.3, 0.3);
+  pitchOut = constrain(pitchOut, -0.3, 0.3);
+  yawOut   = constrain(yawOut,   -0.2, 0.2);
+
+  double m1 = baseThrust - rollOut + pitchOut + yawOut;
+  double m2 = baseThrust + rollOut - pitchOut + yawOut;
+  double m3 = baseThrust + rollOut + pitchOut - yawOut;
+  double m4 = baseThrust - rollOut - pitchOut - yawOut;
+
+  m1_cmd_us = (uint16_t)constrain((int)(m1 * 1000.0 + 1000.0), 1000, 2000);
+  m2_cmd_us = (uint16_t)constrain((int)(m2 * 1000.0 + 1000.0), 1000, 2000);
+  m3_cmd_us = (uint16_t)constrain((int)(m3 * 1000.0 + 1000.0), 1000, 2000);
+  m4_cmd_us = (uint16_t)constrain((int)(m4 * 1000.0 + 1000.0), 1000, 2000);
+
+  if (!motorsArmed) {
+    motorsSetAll(1000);
+  } else {
+    tLib.motors.set(1, m1_cmd_us);
+    tLib.motors.set(2, m2_cmd_us);
+    tLib.motors.set(3, m3_cmd_us);
+    tLib.motors.set(4, m4_cmd_us);
+  }
+
+  // telemetry print at 2 Hz
+  if ((int32_t)(nowMs - nextTelemMs) >= 0) {
+    printTelemetryLine();
+    nextTelemMs = nowMs + TELEMETRY_PERIOD_MS;
+  }
+}
