@@ -269,16 +269,16 @@ static void printTelemetryLine() {
   Serial.print(ay_g, 4); Serial.print(",");
   Serial.print(az_g, 4); Serial.print(",");
 
-  Serial.print(gx_dps, 3); Serial.print(",");
-  Serial.print(gy_dps, 3); Serial.print(",");
-  Serial.print(gz_dps, 3); Serial.print(",");
+  // Serial.print(gx_dps, 3); Serial.print(",");
+  // Serial.print(gy_dps, 3); Serial.print(",");
+  // Serial.print(gz_dps, 3); Serial.print(",");
 
   Serial.print(roll_deg, 2);  Serial.print(",");
   Serial.print(pitch_deg, 2); Serial.print(",");
   Serial.print(yaw_deg, 2);   Serial.print(",");
 
   Serial.print(lipo_V, 3); Serial.print(",");
-  Serial.print(thrust, 3); Serial.print(",");
+  // Serial.print(thrust, 3); Serial.print(",");
 
   Serial.print(m1_cmd_us); Serial.print(",");
   Serial.print(m2_cmd_us); Serial.print(",");
@@ -350,18 +350,18 @@ void loop() {
   static bool yawInit = false;
   if (!yawInit) { yawSetpoint = yaw; yawInit = true; }
 
-  double rollOut  = pidUpdate(roll,  0.0,         0.05, 0.002, 0.001, rollIntegral,  rollLastErr,  dtPid);
-  double pitchOut = pidUpdate(pitch, 0.0,         0.05, 0.002, 0.001, pitchIntegral, pitchLastErr, dtPid);
-  double yawOut   = pidUpdate(yaw,   yawSetpoint, 0.05, 0.002, 0.001, yawIntegral,   yawLastErr,   dtPid);
+  double rollOut  = pidUpdate(roll,  0.0,         0.20, 0.002, 0.001, rollIntegral,  rollLastErr,  dtPid);
+  double pitchOut = pidUpdate(pitch, 0.0,         0.2, 0.002, 0.001, pitchIntegral, pitchLastErr, dtPid);
+  double yawOut   = pidUpdate(yaw,   yawSetpoint, 0.2, 0.002, 0.001, yawIntegral,   yawLastErr,   dtPid);
 
   rollOut  = constrain(rollOut,  -0.3, 0.3);
   pitchOut = constrain(pitchOut, -0.3, 0.3);
   yawOut   = constrain(yawOut,   -0.2, 0.2);
 
-  double m1 = baseThrust - rollOut + pitchOut + yawOut;
-  double m2 = baseThrust + rollOut - pitchOut + yawOut;
-  double m3 = baseThrust + rollOut + pitchOut - yawOut;
-  double m4 = baseThrust - rollOut - pitchOut - yawOut;
+  double m1 = baseThrust - rollOut        //+ yawOut; // CW
+  double m2 = baseThrust - pitchOut       //- yawOut; // CCW
+  double m3 = baseThrust + rollOut        //+ yawOut; // CW
+  double m4 = baseThrust + pitchOut       //- yawOut; // CCW
 
   m1_cmd_us = (uint16_t)constrain((int)(m1 * 1000.0 + 1000.0), 1000, 2000);
   m2_cmd_us = (uint16_t)constrain((int)(m2 * 1000.0 + 1000.0), 1000, 2000);
