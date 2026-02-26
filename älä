@@ -1,0 +1,744 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <avr/pgmspace.h>
+#include <Tonttulib.h>
+
+Tonttulib tLib;
+
+// ===================== USER SETTINGS =====================
+static constexpr uint32_t TELEMETRY_PERIOD_MS = 500;   // 2 Hz
+static constexpr uint32_t TX_DONE_TIMEOUT_MS  = 900;
+static constexpr uint32_t INIT_GAP_MS         = 200;
+static constexpr uint32_t MODE_RECHECK_MS     = 2000;
+
+// RF params (MUST match ground)
+static constexpr const char* RFCFG_CMD =
+  "AT+TEST=RFCFG,868,SF7,125,12,15,14,ON,OFF,OFF";
+
+static constexpr bool LOG_RAW_MODEM_LINES = false;
+static constexpr bool LOG_STATE_CHANGES   = true;
+
+// thrust control
+static constexpr float THRUST_STEP = 0.02f;  // per command
+static constexpr float THRUST_MIN  = 0.00f;
+static constexpr float THRUST_MAX  = 0.90f;  // safety cap
+
+static float baseThrust = 0.45f;
+static bool motorsArmed = false; // FALSE by default
+
+// ===================== Logging =====================
+static void logLine(const char* msg) {
+  Serial.print("[AIR] ");
+  Serial.println(msg);
+}
+
+// ===================== Helpers =====================
+static inline int16_t clamp_i16(int32_t v) {
+  if (v < -32768) return -32768;
+  if (v >  32767) return  32767;
+  return (int16_t)v;
+}
+static inline uint16_t clamp_u16(int32_t v) {
+  if (v < 0) return 0;
+  if (v > 65535) return 65535;
+  return (uint16_t)v;
+}
+static inline float clamp_f(float x, float lo, float hi) {
+  if (x < lo) return lo;
+  if (x > hi) return hi;
+  return x;
+}
+
+// ===================== HEX helpers =====================
+static inline char hn(uint8_t v) { return v < 10 ? char('0' + v) : char('A' + (v - 10)); }
+
+static void bytesToHex(const uint8_t* in, size_t n, char* out /*>=2n+1*/) {
+  for (size_t i = 0; i < n; i++) {
+    out[2 * i]     = hn(in[i] >> 4);
+    out[2 * i + 1] = hn(in[i] & 0xF);
+  }
+  out[2 * n] = 0;
+}
+
+static int hv(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+  if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+  return -1;
+}
+
+static bool hexToBytes(const char* hex, size_t len, uint8_t* out, size_t outMax, size_t& outLen) {
+  outLen = 0;
+  if (len % 2) return false;
+  size_t n = len / 2;
+  if (n > outMax) return false;
+  for (size_t i = 0; i < n; i++) {
+    int hi = hv(hex[2 * i]);
+    int lo = hv(hex[2 * i + 1]);
+    if (hi < 0 || lo < 0) return false;
+    out[i] = (uint8_t)((hi << 4) | lo);
+  }
+  outLen = n;
+  return true;
+}
+
+// ===================== LoRa modem parsing =====================
+static char lineBuf[260];
+static size_t lineLen = 0;
+
+static bool modeIsTest = false;
+static bool modeIsLWABP = false;
+static bool sawTxDone = false;
+
+static void sendCmd(const char* s) {
+  Serial1.print(s);
+  Serial1.print("\r\n");
+}
+
+static bool extractRxHex(const char* line, char* out, size_t outMax, size_t& outLen) {
+  const char* p = strstr(line, "+TEST: RX");
+  if (!p) return false;
+  const char* q1 = strchr(p, '"'); if (!q1) return false;
+  const char* q2 = strchr(q1 + 1, '"'); if (!q2) return false;
+  size_t L = size_t(q2 - (q1 + 1));
+  if (L + 1 > outMax) return false;
+  memcpy(out, q1 + 1, L);
+  out[L] = 0;
+  outLen = L;
+  return true;
+}
+
+// ========================================================
+// Link states  (NO ACKS)
+// ========================================================
+enum LinkState : uint8_t {
+  LS_IDLE,
+  LS_TX_TELEM,
+  LS_WAIT_TXDONE
+};
+
+static LinkState linkState = LS_IDLE;
+static void setLinkState(LinkState s);
+
+static void setLinkState(LinkState s) {
+  if (linkState == s) return;
+  linkState = s;
+  if (!LOG_STATE_CHANGES) return;
+
+  switch (s) {
+    case LS_IDLE:        logLine("STATE IDLE"); break;
+    case LS_TX_TELEM:    logLine("STATE TX_TELEM"); break;
+    case LS_WAIT_TXDONE: logLine("STATE WAIT_TXDONE"); break;
+  }
+}
+
+// ===================== Init / recovery (LoRa module) =====================
+enum InitState : uint8_t {
+  I_IDLE, I_SEND_MODEQ, I_WAIT_MODEQ, I_SEND_FDEFAULT, I_WAIT_FDEFAULT, I_SEND_RESET, I_WAIT_RESET,
+  I_SEND_MODE_TEST, I_WAIT_MODE_TEST, I_SEND_RFCFG, I_WAIT_RFCFG, I_SEND_RX, I_WAIT_RX, I_READY
+};
+
+static InitState initState = I_IDLE;
+static uint32_t initT0 = 0;
+
+static void startRecovery(uint32_t now) {
+  initState = I_SEND_MODEQ;
+  initT0 = now;
+  modeIsTest = false;
+  modeIsLWABP = false;
+  if (LOG_STATE_CHANGES) logLine("LoRa recovery start");
+}
+
+static void initStep(uint32_t now) {
+  auto waited = [&](uint32_t ms) { return (int32_t)(now - initT0) >= (int32_t)ms; };
+
+  switch (initState) {
+    case I_IDLE: startRecovery(now); break;
+
+    case I_SEND_MODEQ:
+      sendCmd("AT+MODE=?");
+      initT0 = now;
+      initState = I_WAIT_MODEQ;
+      break;
+
+    case I_WAIT_MODEQ:
+      if (modeIsTest)  { initState = I_SEND_RFCFG;    initT0 = now; break; }
+      if (modeIsLWABP) { initState = I_SEND_FDEFAULT; initT0 = now; break; }
+      if (waited(400)) initState = I_SEND_MODEQ;
+      break;
+
+    case I_SEND_FDEFAULT:
+      sendCmd("AT+FDEFAULT");
+      initT0 = now;
+      initState = I_WAIT_FDEFAULT;
+      break;
+
+    case I_WAIT_FDEFAULT:
+      if (waited(INIT_GAP_MS)) { initState = I_SEND_RESET; initT0 = now; }
+      break;
+
+    case I_SEND_RESET:
+      sendCmd("AT+RESET");
+      initT0 = now;
+      initState = I_WAIT_RESET;
+      break;
+
+    case I_WAIT_RESET:
+      if (waited(1500)) { initState = I_SEND_MODE_TEST; initT0 = now; }
+      break;
+
+    case I_SEND_MODE_TEST:
+      modeIsTest = false;
+      sendCmd("AT+MODE=TEST");
+      initT0 = now;
+      initState = I_WAIT_MODE_TEST;
+      break;
+
+    case I_WAIT_MODE_TEST:
+      if (modeIsTest) { initState = I_SEND_RFCFG; initT0 = now; break; }
+      if (waited(600)) initState = I_SEND_MODE_TEST;
+      break;
+
+    case I_SEND_RFCFG:
+      sendCmd(RFCFG_CMD);
+      initT0 = now;
+      initState = I_WAIT_RFCFG;
+      break;
+
+    case I_WAIT_RFCFG:
+      if (waited(INIT_GAP_MS)) { initState = I_SEND_RX; initT0 = now; }
+      break;
+
+    case I_SEND_RX:
+      sendCmd("AT+TEST=RXLRPKT");
+      initT0 = now;
+      initState = I_WAIT_RX;
+      break;
+
+    case I_WAIT_RX:
+      if (waited(INIT_GAP_MS)) initState = I_READY;
+      break;
+
+    case I_READY:
+      break;
+  }
+}
+
+// ===================== Radio TX helper =====================
+static uint32_t txStartMs = 0;
+
+static void radioTx(const uint8_t* p, size_t n) {
+  char hex[2 * 64 + 1];
+  bytesToHex(p, n, hex);
+
+  Serial.print("[AIR] TX ");
+  Serial.print((char)p[0]);
+  Serial.print(" len=");
+  Serial.println((int)n);
+
+  Serial1.print("AT+TEST=TXLRPKT,\"");
+  Serial1.print(hex);
+  Serial1.print("\"\r\n");
+
+  sawTxDone = false;
+  txStartMs = millis();
+}
+
+static void armRxNow() {
+  sendCmd("AT+TEST=RXLRPKT");
+}
+
+// ===================== Motors =====================
+static void motorsSetAll(uint16_t us) {
+  tLib.motors.set(1, us);
+  tLib.motors.set(2, us);
+  tLib.motors.set(3, us);
+  tLib.motors.set(4, us);
+}
+
+static uint16_t m1_cmd_us = 1000, m2_cmd_us = 1000, m3_cmd_us = 1000, m4_cmd_us = 1000;
+
+// ===================== Sensors / EKF (acc in g, gyro in dps) =====================
+static float ax=0, ay=0, az=0;
+static float gx=0, gy=0, gz=0;
+
+static float ax_g=0, ay_g=0, az_g=0;
+static float gx_dps=0, gy_dps=0, gz_dps=0;
+
+// accel bias (in g)
+static double accelBiasX=0, accelBiasY=0, accelBiasZ=0;
+
+// gyro bias (in dps)
+static double gyroBiasX=0, gyroBiasY=0, gyroBiasZ=0;
+
+// low-pass for gyro raw during calibration
+static float ogx=0, ogy=0, ogz=0;
+
+// EKF quaternion + covariance scalars (same structure as your snippet)
+static double q0=1, q1=0, q2=0, q3=0;
+static double P0=3, P1=3, P2=3;
+static double accelNoise=0.1;
+static double gyroNoise=0.001;
+
+// filtered angles (radians internally for EKF pipeline)
+static double alphaAngle = 0.1;
+static double rollFiltered = 0;
+static double pitchFiltered = 0;
+static double yawFiltered = 0;
+
+// exported angles for telemetry (degrees)
+static float roll_deg=0, pitch_deg=0, yaw_deg=0;
+
+// IMU timing
+static uint32_t lastImuUs = 0;
+static constexpr uint32_t IMU_PERIOD_US = 5000;
+
+// --- helpers from your EKF ---
+static void normalizeQuaternion() {
+  double n = sqrt(q0*q0 + q1*q1 + q2*q2 + q3*q3);
+  if (n < 1e-9) { q0=1; q1=q2=q3=0; return; }
+  q0/=n; q1/=n; q2/=n; q3/=n;
+}
+
+static void quaternionMultiply(double w, double x, double y, double z){
+  double nw=q0*w - q1*x - q2*y - q3*z;
+  double nx=q0*x + q1*w + q2*z - q3*y;
+  double ny=q0*y - q1*z + q2*w + q3*x;
+  double nz=q0*z + q1*y - q2*x + q3*w;
+  q0=nw; q1=nx; q2=ny; q3=nz;
+}
+
+static void ekfPredict(double gx_rad, double gy_rad, double gz_rad, double dt){
+  double dq0=0.5*(-q1*gx_rad - q2*gy_rad - q3*gz_rad);
+  double dq1=0.5*( q0*gx_rad + q2*gz_rad - q3*gy_rad);
+  double dq2=0.5*( q0*gy_rad - q1*gz_rad + q3*gx_rad);
+  double dq3=0.5*( q0*gz_rad + q1*gy_rad - q2*gx_rad);
+  q0+=dq0*dt; q1+=dq1*dt; q2+=dq2*dt; q3+=dq3*dt;
+  normalizeQuaternion();
+  double qNoiseRoll = gyroNoise * gyroNoise * dt;
+  P0 += qNoiseRoll;
+  P1 += qNoiseRoll;
+  P2 += qNoiseRoll * 4.0;
+}
+
+static void ekfUpdateAccel(double ax_g_in, double ay_g_in, double az_g_in){
+  double norm = sqrt(ax_g_in*ax_g_in + ay_g_in*ay_g_in + az_g_in*az_g_in);
+  if(norm < 1e-6) return;
+  if(fabs(norm - 1.0) > 0.2) return;
+
+  double axn=ax_g_in/norm, ayn=ay_g_in/norm, azn=az_g_in/norm;
+  (void)azn; // not used in your simplified update
+
+  double hx = -2*(q1*q3 + q0*q2);
+  double hy = -2*(q2*q3 - q0*q1);
+
+  double K0 = P0 / (P0 + accelNoise);
+  double K1 = P1 / (P1 + accelNoise);
+
+  double dX = K0 * (ayn - hy);
+  double dY = K1 * (-(axn - hx));
+
+  double theta = sqrt(dX*dX + dY*dY);
+  double dq_w, dq_x, dq_y, dq_z;
+  if(theta < 1e-6){
+    dq_w=1; dq_x=0.5*dX; dq_y=0.5*dY; dq_z=0;
+  } else {
+    double halfTheta = theta * 0.5;
+    double sinHalf = sin(halfTheta) / theta;
+    dq_w = cos(halfTheta);
+    dq_x = dX * sinHalf;
+    dq_y = dY * sinHalf;
+    dq_z = 0;
+  }
+
+  quaternionMultiply(dq_w, dq_x, dq_y, dq_z);
+  normalizeQuaternion();
+
+  P0 *= (1.0 - K0);
+  P1 *= (1.0 - K1);
+}
+
+// --- calibration adapted to your library units (accel in g, gyro in dps) ---
+static void calibrateAccel() {
+  double sumAx=0, sumAy=0, sumAz=0;
+  const int samples = 3000;
+  for(int i=0; i<samples; i++){
+    tLib.imu.readAccel(ax, ay, az); // g
+    sumAx += ax; sumAy += ay; sumAz += az;
+    delayMicroseconds(500);
+  }
+  accelBiasX = sumAx / samples;
+  accelBiasY = sumAy / samples;
+  // expect +1g on Z (depending on orientation). Keep your original convention:
+  accelBiasZ = (sumAz / samples) - 1.0;
+}
+
+static void calibrateGyro() {
+  gyroBiasX = gyroBiasY = gyroBiasZ = 0;
+  ogx = ogy = ogz = 0;
+
+  const int samples = 3000;
+  for (int i=0;i<samples;i++){
+    tLib.imu.readGyro(gx, gy, gz); // dps
+    const float alphaA = 0.2f;
+    ogx += alphaA * (gx - ogx); gx = ogx;
+    ogy += alphaA * (gy - ogy); gy = ogy;
+    ogz += alphaA * (gz - ogz); gz = ogz;
+
+    gyroBiasX += gx;
+    gyroBiasY += gy;
+    gyroBiasZ += gz;
+    delayMicroseconds(500);
+  }
+  gyroBiasX /= samples;
+  gyroBiasY /= samples;
+  gyroBiasZ /= samples;
+}
+
+// EKF + filtered Euler output update
+static void sensorStep(uint32_t nowUs){
+  if ((int32_t)(nowUs - lastImuUs) < (int32_t)IMU_PERIOD_US) return;
+
+  const uint32_t prevUs = lastImuUs;
+  lastImuUs = nowUs;
+
+  double dt = (nowUs - prevUs) * 1e-6;
+  if (dt <= 0.0 || dt > 0.1) dt = 0.005; // safety clamp
+
+  // read sensors
+  tLib.imu.readAccel(ax, ay, az); // g
+  tLib.imu.readGyro(gx, gy, gz);  // dps
+
+  // apply accel bias (in g)
+  ax_g = ax - (float)accelBiasX;
+  ay_g = ay - (float)accelBiasY;
+  az_g = az - (float)accelBiasZ;
+
+  // adaptive gyro bias update when stable (same condition style as your snippet)
+  float gyroMag = sqrtf(gx*gx + gy*gy + gz*gz);
+  if(gyroMag < 0.5f && fabsf(ax_g) < 0.15f && fabsf(ay_g) < 0.15f && fabsf(az_g - 1.0f) < 0.20f){
+    const float biasAlpha = 0.05f;
+    gyroBiasX += biasAlpha * (gx - gyroBiasX);
+    gyroBiasY += biasAlpha * (gy - gyroBiasY);
+    gyroBiasZ += biasAlpha * (gz - gyroBiasZ);
+  }
+
+  // apply gyro bias (dps)
+  gx_dps = gx - (float)gyroBiasX;
+  gy_dps = gy - (float)gyroBiasY;
+  gz_dps = gz - (float)gyroBiasZ;
+
+  // EKF step (gyro in rad/s)
+  ekfPredict(gx_dps * DEG_TO_RAD, gy_dps * DEG_TO_RAD, gz_dps * DEG_TO_RAD, dt);
+  ekfUpdateAccel(ax_g, ay_g, az_g);
+
+  // quaternion -> euler (radians)
+  double roll  = atan2(2*(q0*q1 + q2*q3), 1 - 2*(q1*q1 + q2*q2));
+  double pitch = asin(2*(q0*q2 - q3*q1));
+  double yaw   = atan2(2*(q0*q3 + q1*q2), 1 - 2*(q2*q2 + q3*q3));
+
+  // low-pass filter angles (radians)
+  rollFiltered  += alphaAngle * (roll  - rollFiltered);
+  pitchFiltered += alphaAngle * (pitch - pitchFiltered);
+  yawFiltered   += alphaAngle * (yaw   - yawFiltered);
+
+  // export degrees for telemetry
+  roll_deg  = (float)(rollFiltered  * (180.0 / 3.14159265358979323846));
+  pitch_deg = (float)(pitchFiltered * (180.0 / 3.14159265358979323846));
+  yaw_deg   = (float)(yawFiltered   * (180.0 / 3.14159265358979323846));
+}
+
+// ===================== Telemetry packet (24 bytes) =====================
+static uint8_t telemSeq = 0;
+static uint32_t nextTelemMs = 0;
+
+static void buildTelemetry(uint8_t* p /*32 bytes*/) {
+  auto put_i16 = [&](int idx, int16_t v) {
+    p[idx + 0] = (uint8_t)(v & 0xFF);
+    p[idx + 1] = (uint8_t)((v >> 8) & 0xFF);
+  };
+  auto put_u16 = [&](int idx, uint16_t v) {
+    p[idx + 0] = (uint8_t)(v & 0xFF);
+    p[idx + 1] = (uint8_t)((v >> 8) & 0xFF);
+  };
+
+  p[0] = 'T';
+  p[1] = telemSeq++;
+
+  int16_t ax_mg = clamp_i16((int32_t)lroundf(ax_g * 1000.0f));
+  int16_t ay_mg = clamp_i16((int32_t)lroundf(ay_g * 1000.0f));
+  int16_t az_mg = clamp_i16((int32_t)lroundf(az_g * 1000.0f));
+
+  int16_t gx_cdps = clamp_i16((int32_t)lroundf(gx_dps * 100.0f));
+  int16_t gy_cdps = clamp_i16((int32_t)lroundf(gy_dps * 100.0f));
+  int16_t gz_cdps = clamp_i16((int32_t)lroundf(gz_dps * 100.0f));
+
+  int16_t roll_cdeg  = clamp_i16((int32_t)lroundf(roll_deg  * 100.0f));
+  int16_t pitch_cdeg = clamp_i16((int32_t)lroundf(pitch_deg * 100.0f));
+  int16_t yaw_cdeg   = clamp_i16((int32_t)lroundf(yaw_deg   * 100.0f));
+
+  uint16_t lipo_mV = (uint16_t)(tLib.vlipo.readVoltage() * 1000.0f);
+  uint16_t thrust_permille = clamp_u16((int32_t)lroundf(baseThrust * 1000.0f));
+
+  put_i16( 2, ax_mg);
+  put_i16( 4, ay_mg);
+  put_i16( 6, az_mg);
+  put_i16( 8, gx_cdps);
+  put_i16(10, gy_cdps);
+  put_i16(12, gz_cdps);
+  put_i16(14, roll_cdeg);
+  put_i16(16, pitch_cdeg);
+  put_i16(18, yaw_cdeg);
+  put_u16(20, lipo_mV);
+  put_u16(22, thrust_permille);
+
+  // NEW: commanded motor PWM (us)
+  put_u16(24, m1_cmd_us);
+  put_u16(26, m2_cmd_us);
+  put_u16(28, m3_cmd_us);
+  put_u16(30, m4_cmd_us);
+}
+
+
+// ===================== Commands (NO ACKS) =====================
+static void applyCommand(uint8_t cmd) {
+  switch (cmd) {
+    case 1: tLib.led.on();        Serial.println("[AIR] LED on"); break;
+    case 2: tLib.led.off();       Serial.println("[AIR] LED off"); break;
+    case 3: tLib.led.blinkFast(); Serial.println("[AIR] LED blinkFast"); break;
+    case 4: tLib.led.blinkSlow(); Serial.println("[AIR] LED blinkSlow"); break;
+
+    case 10:
+      baseThrust = clamp_f(baseThrust + THRUST_STEP, THRUST_MIN, THRUST_MAX);
+      Serial.print("[AIR] baseThrust up -> "); Serial.println(baseThrust, 3);
+      break;
+
+    case 11:
+      baseThrust = clamp_f(baseThrust - THRUST_STEP, THRUST_MIN, THRUST_MAX);
+      Serial.print("[AIR] baseThrust down -> "); Serial.println(baseThrust, 3);
+      break;
+
+    case 12: // fly (arm)
+      motorsArmed = true;
+      Serial.println("[AIR] MOTORS ARMED (fly)");
+      break;
+
+    case 13: // stop (kill + disarm)
+      motorsArmed = false;
+      baseThrust = 0.0f;
+      motorsSetAll(1000);
+      Serial.println("[AIR] MOTORS DISARMED + STOP");
+      break;
+
+    default:
+      Serial.println("[AIR] unknown cmd");
+      break;
+  }
+}
+
+static void handleCommandPacket(const uint8_t* p, size_t n) {
+  if (n < 3) return;
+  if (p[0] != 'C') return;
+
+  const uint8_t seq = p[1];
+  const uint8_t cmd = p[2];
+
+  Serial.print("[AIR] RX C seq="); Serial.print(seq);
+  Serial.print(" cmd="); Serial.println(cmd);
+
+  applyCommand(cmd);
+
+  // NO ACKS: do nothing else
+}
+
+// ===================== UART line handler =====================
+static void handleRadioLine(const char* l) {
+  if (LOG_RAW_MODEM_LINES) {
+    Serial.print("[AIR][RAW] ");
+    Serial.println(l);
+  }
+
+  if (strstr(l, "+MODE: TEST"))  { modeIsTest = true; modeIsLWABP = false; }
+  if (strstr(l, "+MODE: LWABP")) { modeIsLWABP = true; modeIsTest = false; }
+
+  if (strstr(l, "TX") && strstr(l, "DONE")) {
+    sawTxDone = true;
+  }
+
+  char hexPayload[200];
+  size_t hexLen = 0;
+  if (extractRxHex(l, hexPayload, sizeof(hexPayload), hexLen)) {
+    uint8_t pkt[64]; size_t pktLen = 0;
+    if (!hexToBytes(hexPayload, hexLen, pkt, sizeof(pkt), pktLen)) return;
+    handleCommandPacket(pkt, pktLen);
+  }
+}
+
+static void pollRadioUart() {
+  while (Serial1.available()) {
+    char c = (char)Serial1.read();
+    if (c == '\r') continue;
+    if (c == '\n') {
+      lineBuf[lineLen] = 0;
+      handleRadioLine(lineBuf);
+      lineLen = 0;
+    } else {
+      if (lineLen + 1 < sizeof(lineBuf)) lineBuf[lineLen++] = c;
+      else lineLen = 0;
+    }
+  }
+}
+
+// ===================== Link step (NO ACKS) =====================
+static void linkStep(uint32_t nowMs) {
+  // periodic mode check
+  static uint32_t nextModeCheck = 0;
+  if ((int32_t)(nowMs - nextModeCheck) >= 0) {
+    sendCmd("AT+MODE=?");
+    nextModeCheck = nowMs + MODE_RECHECK_MS;
+    if (modeIsLWABP) {
+      startRecovery(nowMs);
+      setLinkState(LS_IDLE);
+      return;
+    }
+  }
+
+  switch (linkState) {
+    case LS_IDLE:
+      if ((int32_t)(nowMs - nextTelemMs) >= 0) {
+        setLinkState(LS_TX_TELEM);
+      }
+      break;
+
+    case LS_TX_TELEM: {
+      uint8_t p[32];
+      buildTelemetry(p);
+      radioTx(p, sizeof(p));
+      setLinkState(LS_WAIT_TXDONE);
+      break;
+    }
+
+    case LS_WAIT_TXDONE:
+      if (sawTxDone || (int32_t)(nowMs - txStartMs) >= (int32_t)TX_DONE_TIMEOUT_MS) {
+        sawTxDone = false;
+        armRxNow(); // always keep RX armed after any TX
+        nextTelemMs = nowMs + TELEMETRY_PERIOD_MS;
+        setLinkState(LS_IDLE);
+      }
+      break;
+  }
+}
+
+// ===================== Setup / loop =====================
+void setup() {
+  Wire.begin();
+  Serial.begin(115200);
+  Serial1.begin(9600);
+
+  logLine("Boot");
+
+  int status = tLib.init();
+  if (status != 1) {
+    Serial.print("[AIR] Tonttulib init failed code: ");
+    Serial.println(status);
+    while (true) {}
+  }
+
+  tLib.led.off();
+
+  // safe motors
+  motorsSetAll(1000);
+
+  // Serial.println("[AIR] Calibrating gyro...");
+  // calibrateGyro();
+  // Serial.println("[AIR] Gyro done.");
+
+  initState = I_IDLE;
+  initT0 = millis();
+
+  lastImuUs = micros();
+  nextTelemMs = millis() + TELEMETRY_PERIOD_MS;
+  setLinkState(LS_IDLE);
+}
+
+void loop() {
+  const uint32_t nowMs = millis();
+  const uint32_t nowUs = micros();
+
+  tLib.update();
+
+  // sensor update
+  sensorStep(nowUs);
+
+  // ===================== Attitude PID + mixing (your style) =====================
+  static double rollIntegral=0, pitchIntegral=0, yawIntegral=0;
+  static double rollLastErr=0, pitchLastErr=0, yawLastErr=0;
+
+  auto pidUpdate = [&](double input, double setpoint,
+                       double kp, double ki, double kd,
+                       double &integral, double &lastErr, double dt) -> double {
+    double err = setpoint - input;
+    integral += err * dt;
+    integral = constrain(integral, -0.3, 0.3);
+    double derivative = (dt > 1e-6) ? (err - lastErr) / dt : 0.0;
+    lastErr = err;
+    return kp*err + ki*integral + kd*derivative;
+  };
+
+  // compute dt for PID from micros() (independent of EKF dt clamp)
+  static uint32_t lastPidUs = 0;
+  if (lastPidUs == 0) lastPidUs = nowUs;
+  double dtPid = (nowUs - lastPidUs) * 1e-6;
+  lastPidUs = nowUs;
+  if (dtPid <= 0.0 || dtPid > 0.1) dtPid = 0.005;
+
+  // Use EKF-filtered angles (degrees) converted to radians like your controller expects
+  double roll  = roll_deg  * (3.14159265358979323846 / 180.0);
+  double pitch = pitch_deg * (3.14159265358979323846 / 180.0);
+  double yaw   = yaw_deg   * (3.14159265358979323846 / 180.0);
+
+  // yaw hold setpoint init
+  static double yawSetpoint = 0.0;
+  static bool yawInit = false;
+  if (!yawInit) { yawSetpoint = yaw; yawInit = true; }
+
+  // PID gains from your snippet
+  double rollOut  = pidUpdate(roll,  0.0,         0.05, 0.002, 0.001, rollIntegral,  rollLastErr,  dtPid);
+  double pitchOut = pidUpdate(pitch, 0.0,         0.05, 0.002, 0.001, pitchIntegral, pitchLastErr, dtPid);
+  double yawOut   = pidUpdate(yaw,   yawSetpoint, 0.05, 0.002, 0.001, yawIntegral,   yawLastErr,   dtPid);
+
+  rollOut  = constrain(rollOut,  -0.3, 0.3);
+  pitchOut = constrain(pitchOut, -0.3, 0.3);
+  yawOut   = constrain(yawOut,   -0.2, 0.2);
+
+  // mix (your exact formula); baseThrust is 0..1
+  double m1 = baseThrust - rollOut + pitchOut + yawOut;
+  double m2 = baseThrust + rollOut - pitchOut + yawOut;
+  double m3 = baseThrust + rollOut + pitchOut - yawOut;
+  double m4 = baseThrust - rollOut - pitchOut - yawOut;
+
+  // map 0..1 thrust to 1000..2000 us (commanded)
+  m1_cmd_us = (uint16_t)constrain((int)(m1 * 1000.0 + 1000.0), 1000, 2000);
+  m2_cmd_us = (uint16_t)constrain((int)(m2 * 1000.0 + 1000.0), 1000, 2000);
+  m3_cmd_us = (uint16_t)constrain((int)(m3 * 1000.0 + 1000.0), 1000, 2000);
+  m4_cmd_us = (uint16_t)constrain((int)(m4 * 1000.0 + 1000.0), 1000, 2000);
+
+  // Apply to ESCs only when armed; otherwise keep outputs at 1000us
+  if (!motorsArmed) {
+    motorsSetAll(1000);
+  } else {
+    tLib.motors.set(1, m1_cmd_us);
+    tLib.motors.set(2, m2_cmd_us);
+    tLib.motors.set(3, m3_cmd_us);
+    tLib.motors.set(4, m4_cmd_us);
+  }
+
+  pollRadioUart();
+
+  if (initState != I_READY) {
+    initStep(nowMs);
+    return;
+  }
+
+  linkStep(nowMs);
+}
