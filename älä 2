@@ -5,6 +5,9 @@
 
 Tonttulib tLib;
 
+    float alphaA = 0.2;
+
+
 // ===================== USER SETTINGS =====================
 static constexpr uint32_t TELEMETRY_PERIOD_MS = 500;   // 2 Hz
 
@@ -46,6 +49,7 @@ static uint16_t m1_cmd_us = 1000, m2_cmd_us = 1000, m3_cmd_us = 1000, m4_cmd_us 
 // ===================== Sensors / EKF (acc in g, gyro in dps) =====================
 static float ax=0, ay=0, az=0;
 static float gx=0, gy=0, gz=0;
+static float ogx=0, ogy=0, ogz=0;
 
 static float ax_g=0, ay_g=0, az_g=0;
 static float gx_dps=0, gy_dps=0, gz_dps=0;
@@ -154,6 +158,14 @@ static void sensorStep(uint32_t nowUs){
 
   tLib.imu.readAccel(ax, ay, az); // g
   tLib.imu.readGyro(gx, gy, gz);  // dps
+
+    // SIIR FOR RAW GYRO
+    ogx += alphaA * (gx-ogx);
+    gx=ogx;
+    ogy += alphaA * (gy-ogy);
+    gy=ogy;
+    ogz += alphaA * (gz-ogz);
+    gz=ogz;
 
   ax_g = ax - (float)accelBiasX;
   ay_g = ay - (float)accelBiasY;
