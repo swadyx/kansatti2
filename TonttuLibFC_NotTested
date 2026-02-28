@@ -1,53 +1,30 @@
-#include <Wire.h>
-#include <avr/pgmspace.h>
 #include <Tonttulib.h>
+#include <Wire.h>
+
+#define DEG_TO_RAD (PI / 180.0)
 
 Tonttulib tLib;
 
-#define GPS_BYTE_TIMEOUT_MS 250
-#define PI 3.141592653589793
-#define DEG_TO_RAD (PI / 180.0)
+double q0=1,q1=0,q2=0,q3=0;
+double P0=3, P1=3, P2=3;
+double accelNoise=0.005;
+double gyroNoise=0.1;
+double alphaAngle = 0.4;
 
-constexpr float MG_TO_G = 1.0f / 1000.0f;
-unsigned long imuIntervalMs = 20;
-unsigned long lastImuTime = 0;
-double alphaAngle = 0.1;
-// ================= AUTOMATIC ACCEL ORIENTATION RACOVERY ================ (todella AI avustettu about 90% koska tää meni jo väsymyksee mut tärkee lisäys)
-bool enableAutoLevelRecovery = true;       // you can turn off for testing
-unsigned long lastStableTime = 0;
-const unsigned long STABLE_TIMEOUT_MS = 800;   
-const float GYRO_STABLE_THRESH_DPS = 15.0;     
-const float ACCEL_NEAR_G_MIN = 0.85;
-const float ACCEL_NEAR_G_MAX = 1.15;
-// ================= FILTER =================
+double thrust=0.45;
+double rollIntegral=0, pitchIntegral=0, yawIntegral=0;
+double rollLastErr=0, pitchLastErr=0, yawLastErr=0;
+double motor1_pwm, motor2_pwm, motor3_pwm, motor4_pwm;
+
 double rollFiltered = 0;
 double pitchFiltered = 0;
 double yawFiltered = 0;
 
-// ================= IMU =================
 float ax, ay, az;
 float gx, gy, gz;
 float ogx, ogy, ogz;
-int16_t temp;
+double rollOut, pitchOut, yawOut;
 
-// ================= ACCEL BIAS ===============
-double accelBiasX=0, accelBiasY=0, accelBiasZ=0;
-void calibrateAccel() {
-  double sumAx=0, sumAy=0, sumAz=0;
-  const int samples = 3000;
-  for(int i=0; i<samples; i++){
-    tLib.imu.readAccel(ax, ay, az) // in g
-    sumAx += ax;
-    sumAy += ay;
-    sumAz += az;
-    delayMicroseconds(500);
-  }
-  accelBiasX = sumAx / samples;
-  accelBiasY = sumAy / samples;
-  accelBiasZ = sumAz / samples + 1.0;
-}
-
-// ================= GYRO BIAS ===============
 double gyroBiasX=0, gyroBiasY=0, gyroBiasZ=0;
 void calibrateGyro(){
   const int samples = 3000;
@@ -72,24 +49,19 @@ void calibrateGyro(){
   ogy = 0;
   ogz = 0;
 }
-
-// ================= EKF STATE =================
-double q0=1, q1=0, q2=0, q3=0;
-double P0=3, P1=3, P2=3;
-double accelNoise=0.1;
-double gyroNoise=0.001;
-float alphaGyro=1;
-double lastGPSLat=0;
-double lastGPSLon=0;
-double currentYaw=0;
-double thrust=0.45;
-double rollIntegral=0, pitchIntegral=0, yawIntegral=0;
-double rollLastErr=0, pitchLastErr=0, yawLastErr=0;
-double motor1_pwm, motor2_pwm, motor3_pwm, motor4_pwm;
-
-
-// ================= Utility =================
-
+double accelBiasX=0, accelBiasY=0, accelBiasZ=0;
+void calibrateAccel() {
+  double sumAx=0, sumAy=0, sumAz=0;
+  const int samples = 3000;
+  for(int i=0; i<samples; i++){
+    tLib.imu.readAccel(ax, ay, az);
+    sumAx += ax;
+    sumAy += ay;
+    delayMicroseconds(500);
+  }
+  accelBiasX = sumAx / samples;
+  accelBiasY = sumAy / samples;
+}
 const double LAT_TO_METERS = 111320.0;
 double lonToMeters(double latDeg) { return LAT_TO_METERS * cos(latDeg * DEG_TO_RAD); }
 struct vector3 {
@@ -122,7 +94,6 @@ double pidUpdate(double input,double setpoint,
   return kp*err + ki*integral + kd*derivative;
 }
 
-// ================= EKF =================
 void ekfPredict(double gx,double gy,double gz,double dt){
   double dq0=0.5*(-q1*gx - q2*gy - q3*gz);
   double dq1=0.5*( q0*gx + q2*gz - q3*gy);
@@ -149,9 +120,9 @@ void ekfUpdateAccel(double ax,double ay,double az){
   if (fabs(norm - 1.0) > 0.2) return;
 
   ax/=norm; ay/=norm; az/=norm;
-  double hx = -2 * (q1 * q3 + q0 * q2);
-  double hy = -2 * (q2 * q3 - q0 * q1);
-  double hz = -(q0 * q0 - q1 * q1 - q2 * q2 + q3 * q3);
+  double hx = 2 * (q1 * q3 + q0 * q2);
+  double hy = 2 * (q2 * q3 - q0 * q1);
+  double hz = (q0 * q0 - q1 * q1 - q2 * q2 + q3 * q3);
 
   double y0=ax-hx;
   double y1=ay-hy;
@@ -188,242 +159,51 @@ void ekfUpdateAccel(double ax,double ay,double az){
   P2*=(1.0-K2);
 }
 
-// ================= POSITION CONTROL VARIABLES =================
-double startLat=0, startLon=0, startAlt=0;
-bool hasStartPos = false;
+void setup() {
+    Serial.begin(115200);
 
-vector3 measuredPos = {0,0,0};
-vector3 lastPosition = {0,0,0};
-vector3 targetPosition = {0,0,0};
-vector3 currentVelocity = {0,0,0};
+    int status = tLib.init();
+    if (status != 1) {
+        Serial.print("Initialization failed with code: ");
+        Serial.println(status);
+        while (true);
+    }
 
-double descentVelocitySetpoint = -1.0; // m/s - laskeutumine
-String curState = "DEMO"; // DROP --> STABILIZE --> FLIGHT --> LAND | DEMO - (vaan stablizise ig)
-
-double xIntegral=0, xLastErr=0;
-double yIntegral=0, yLastErr=0;
-double zPosIntegral=0, zPosLastErr=0;
-double zVelIntegral=0, zVelLastErr=0;
-
-double hoverThrust = 0.45; // base thrust
-const double groundZ = 0; // Jotenki napataa from gps en osaa ja jaksa 
-
-unsigned long stateStartTime = 0;
-bool isStable = false;
-unsigned long stableStartTime = 0;
-static double prevLat = 0, prevLon = 0, prevAlt = 0;
-static unsigned long prevGpsTime = 0;
-// ================= SETUP =================
-void setup(){
-  Wire.begin();
-
-  Serial.begin(115200);
-
-  int status = tLib.init();
-  if (status != 1) {
-      Serial.print("Initialization failed with code: ");
-      Serial.println(status);
-      while (true);
-  }
-
-  tLib.led.blinkFast();
-
-  Serial.println("All sensors initialized!");
-  calibrateGyro();
-  calibrateAccel();
-
-    // // --- Motors ---
-  tLib.motors.set(1, 2000);
-  tLib.motors.set(2, 2000);
-  tLib.motors.set(3, 2000);
-  tLib.motors.set(4, 2000);
-
-  delay(10000); // give ESCs time to arm
-
-  tLib.motors.set(1, 1000);
-  tLib.motors.set(2, 1000);
-  tLib.motors.set(3, 1000);
-  tLib.motors.set(4, 1000);
-
-  delay(10000); // give ESCs time to arm
-
-  thrust = 0.0; // Start with no thrust in DROP
-  stateStartTime = millis();
+    tLib.led.blinkFast();
+    calibrateGyro();
+    calibrateAccel();
 }
 
-// ================= LOOP =================
-void loop(){
-  if(curState != "DEMO" && tLib.gps.hasNewData()){
-    double lat = tLib.gps.latitude()  / 10000000.0;
-    double lon = tLib.gps.longitude() / 10000000.0;
-    double alt = tLib.gps.altitude()  / 1000.0;
-    unsigned long t = millis();
-
-    if (prevGpsTime > 0 && (t - prevGpsTime) < 1500) {   // not too old
-        double dt = (t - prevGpsTime) * 0.001;           // seconds
-
-        double dLat = (lat - prevLat) * DEG_TO_RAD;
-        double dLon = (lon - prevLon) * DEG_TO_RAD;
-
-        double avgLat = (lat + prevLat)/2.0 * DEG_TO_RAD;
-
-        double dy = 6371000.0 * dLat;                        // north ≈ meters
-        double dx = 6371000.0 * dLon * cos(avgLat);          // east ≈ meters
-
-        double gpsVelY = dy / dt;   // m/s north
-        double gpsVelX = dx / dt;   // m/s east
-        double gpsVelZ = (alt - prevAlt) / dt;
-
-        // Very simple low-pass / outlier rejection
-        const float alpha = 0.4;
-        currentVelocity.x += alpha * (gpsVelX - currentVelocity.x);
-        currentVelocity.y += alpha * (gpsVelY - currentVelocity.y);
-        currentVelocity.z += alpha * (gpsVelZ - currentVelocity.z);
-    }
-
-    prevLat = lat;
-    prevLon = lon;
-    prevAlt = alt;
-    prevGpsTime = t;
-    currentVelocity = {gpsVelX, gpsVelY, gpsVelZ};
-    if(!hasStartPos){
-      startLat = gpsLat;
-      startLon = gpsLon;
-      startAlt = gpsAlt;
-      hasStartPos = true;
-    }
-    if(hasStartPos){
-      double dLat = gpsLat - startLat;
-      double dLon = gpsLon - startLon;
-      double dAlt = gpsAlt - startAlt;
-      double avgLat = (gpsLat + startLat) / 2.0;
-      double metersPerDegLon = lonToMeters(avgLat);
-      measuredPos.x = dLon * metersPerDegLon; 
-      measuredPos.y = dLat * LAT_TO_METERS; 
-      measuredPos.z = dAlt; 
-    }
-    double dx=(gpsLat-lastGPSLat)*111320.0;
-    double dy=(gpsLon-lastGPSLon)*111320.0*cos(gpsLat*DEG_TO_RAD);
-
-    lastGPSLat=gpsLat;
-    lastGPSLon=gpsLon;
-
-    if(dx!=0.00f && dy!=0.00f){
-      double gpsYaw=atan2(dy,dx);
-      currentYaw += 0.1*(gpsYaw-currentYaw);
-      double yawError=gpsYaw-currentYaw;
-      quaternionMultiply(cos(0.5*yawError),0,0,sin(0.5*yawError));
-      normalizeQuaternion();
-    }
-  }
-
-  unsigned long now=millis();
-  if(now-lastImuTime>=imuIntervalMs){
-    double dt=0.02;
-    lastImuTime=now;
+void loop() {
+    double dt = 0.02;
 
     tLib.imu.readAccel(ax, ay, az);
+    ax-=accelBiasX;
+    ay-=accelBiasY;
     tLib.imu.readGyro(gx, gy, gz);
+    gx-=gyroBiasX;
+    gy-=gyroBiasY;
+    gz-=gyroBiasZ;
 
-    ax*=MG_TO_G; ay*=MG_TO_G; az*=MG_TO_G;
-    ax -= accelBiasX;
-    ay -= accelBiasY;
-    az -= accelBiasZ;
+    ekfPredict(gx*DEG_TO_RAD,
+                gy*DEG_TO_RAD,
+                gz*DEG_TO_RAD,
+                dt);
 
-    float gyroNorm = sqrt(gx * gx + gy * gy + gz * gz);
-    if (gyroNorm < .5 && fabs(ax) < 0.15f && fabs(ay) < 0.15f && fabs(az+1.0f) < 0.20f) {
+    ekfUpdateAccel(ax,ay,az);
+
+    double gyroNorm = sqrt(gx*gx+gy*gy+gz*gz);
+    if (gyroNorm < 1 && fabs(ax) < 0.15f && fabs(ay) < 0.15f && fabs(az-1.0f) < 0.20) {
         const float biasAlpha = 0.05;
         gyroBiasX += biasAlpha * (gx - gyroBiasX);
         gyroBiasY += biasAlpha * (gy - gyroBiasY);
         gyroBiasZ += biasAlpha * (gz - gyroBiasZ);
     }
 
-        
-      if (enableAutoLevelRecovery) {
-        float gyroMagnitude = sqrt(gx*gx + gy*gy + gz*gz);  // dps
-        float accelMagnitude = sqrt(ax*ax + ay*ay + az*az) * MG_TO_G;  // already in g after bias subtract
 
-        bool isStable =
-          (gyroMagnitude < GYRO_STABLE_THRESH_DPS) &&
-          (accelMagnitude > ACCEL_NEAR_G_MIN && accelMagnitude < ACCEL_NEAR_G_MAX);
-
-        if (isStable) {
-          if (lastStableTime == 0) {
-            lastStableTime = millis();
-          }
-
-          unsigned long stableDuration = millis() - lastStableTime;
-          if (stableDuration >= STABLE_TIMEOUT_MS) {
-            // We have been stable long enough → snap roll & pitch to gravity
-
-            // Measured gravity direction (normalized, in body frame)
-            float norm = sqrt(ax*ax + ay*ay + az*az);
-            if (norm > 1e-6) {
-              float nx = ax / norm;
-              float ny = ay / norm;
-              float nz = az / norm;
-
-              // We assume target: gravity in body = (0, 0, +1) or (0,0,-1) depending on coord system
-              // Your code seems to expect az ≈ +1 when level (check your hz = -(...) expression)
-
-              // Simple way: compute quaternion that rotates current gravity vector to (0,0,1)
-              // Vector to align: current gravity dir → (0,0,1)
-
-              // Cross product gives rotation axis
-              float vx = ny * 1.0 - nz * 0.0;   // ny*1 - nz*0
-              float vy = nz * 0.0 - nx * 1.0;
-              float vz = nx * 0.0 - ny * 0.0;
-
-              float crossMag = sqrt(vx*vx + vy*vy + vz*vz);
-              float dot = nz;  // cos(angle) = dot product with (0,0,1)
-
-              if (crossMag < 1e-5) {
-                // Already almost aligned → do nothing or small yaw preserve
-                // but we can still reset if wanted
-              } else {
-                float angle = acos(constrain(dot, -1.0f, 1.0f));
-                float halfAngle = angle * 0.5f;
-                float s = sin(halfAngle);
-
-                // Axis-angle → quaternion
-                float qw = cos(halfAngle);
-                float qx = vx / crossMag * s;
-                float qy = vy / crossMag * s;
-                float qz = vz / crossMag * s;
-
-                // Apply this rotation → this snaps tilt, preserves yaw-ish
-                quaternionMultiply(qw, qx, qy, qz);
-                normalizeQuaternion();
-
-                // Optional: reset covariances so filter trusts new state
-                P0 = 0.1;
-                P1 = 0.1;
-                P2 = 3.0;   // keep yaw uncertain
-
-                Serial.println("AUTO-LEVEL RECOVERY SNAP PERFORMED");
-              }
-            }
-
-            // Reset timer so we don't snap every loop
-            lastStableTime = 0;
-          }
-        } else {
-          // Not stable anymore → reset timer
-          lastStableTime = 0;
-        }
-      }
-
-    ekfPredict(gx*DEG_TO_RAD,
-               gy*DEG_TO_RAD,
-               gz*DEG_TO_RAD,
-               dt);
-    ekfUpdateAccel(ax,ay,az);
-
-    double roll=atan2(2*(q0*q1+q2*q3),
-                      1-2*(q1*q1+q2*q2));
-    double pitch=asin(2*(q0*q2-q3*q1));
-    double yaw=atan2(2*(q0*q3+q1*q2),
-                     1-2*(q2*q2+q3*q3));
+    double roll  = atan2( q1*q0 + q2*q3 , 0.5 - q1*q1 - q2*q2 );
+    double pitch = asin ( 2.0 * (q0*q2 - q3*q1) )              ;
+    double yaw   = atan2( q1*q2 + q0*q3 , 0.5 - q2*q2 - q3*q3 );
 
     rollFiltered += alphaAngle * (roll-rollFiltered);
     pitchFiltered += alphaAngle * (pitch-pitchFiltered);
@@ -432,90 +212,11 @@ void loop(){
     roll = rollFiltered;
     pitch = pitchFiltered;
     yaw = yawFiltered;
+    
+    rollOut = pidUpdate(roll, 0, 0.05, 0.002, 0.001, rollIntegral, rollLastErr);
+    pitchOut = pidUpdate(pitch, 0, 0.05, 0.002, 0.001, pitchIntegral, pitchLastErr);
+    yawOut = pidUpdate(yaw, yaw, 0.05, 0.002, 0.001, yawIntegral, yawLastErr);
 
-    double rollOut, pitchOut, yawOut;
-    double desiredVelZ = 0.0;
-    double zSetpoint = 0.0; // Will be adjusted per state
-
-    if (curState == "DROP") {
-      thrust = 0.0;
-      rollOut = 0.0;
-      pitchOut = 0.0;
-      yawOut = 0.0;
-      // tiedetää millon ollaa raketist pois ja putoomas ig
-      if (measuredPos.z <= -1.0) {
-        curState = "STABILIZE";
-        stateStartTime = now;
-        thrust = hoverThrust; 
-      }
-    } else {
-      double rollSet = 0.0;
-      double pitchSet = 0.0;
-      double yawSet = (curState == "DEMO") ? yaw : 0.0;
-      if (curState == "FLIGHT") {
-        double xOut = pidUpdate(measuredPos.x, targetPosition.x, 0.2, 0.0, 0.01, xIntegral, xLastErr);
-        double yOut = pidUpdate(measuredPos.y, targetPosition.y, 0.2, 0.0, 0.01, yIntegral, yLastErr);
-        rollSet = xOut;
-        pitchSet = -yOut;
-        rollSet = constrain(rollSet, -0.5, 0.5);
-        pitchSet = constrain(pitchSet, -0.5, 0.5);
-      }
-
-      rollOut = pidUpdate(roll, rollSet, 0.05, 0.002, 0.001, rollIntegral, rollLastErr);
-      pitchOut = pidUpdate(pitch, pitchSet, 0.05, 0.002, 0.001, pitchIntegral, pitchLastErr);
-      yawOut = pidUpdate(yaw, yawSet, 0.05, 0.002, 0.001, yawIntegral, yawLastErr);
-
-      rollOut = constrain(rollOut, -0.3, 0.3);
-      pitchOut = constrain(pitchOut, -0.3, 0.3);
-      yawOut = constrain(yawOut, -0.2, 0.2);
-
-      if (curState == "STABILIZE") {
-        desiredVelZ = 0.0;
-        if (abs(roll) < 0.1 && abs(pitch) < 0.1 && abs(currentVelocity.z) < 0.5) {
-          if (!isStable) {
-            stableStartTime = now;
-            isStable = true;
-          } else if (now - stableStartTime >= 2000) { // 2 sekuttiii stable
-            curState = "FLIGHT";
-            stateStartTime = now;
-            zSetpoint = measuredPos.z;
-            isStable = false;
-          }
-        } else {
-          isStable = false;
-        }
-      } else if (curState == "FLIGHT") {
-        double altError = zSetpoint - measuredPos.z;
-        desiredVelZ = pidUpdate(altError, 0.0, 1.2, 0.4, 0.6, zPosIntegral, zPosLastErr);
-        double horizDist = sqrt(measuredPos.x * measuredPos.x + measuredPos.y * measuredPos.y);
-        if (horizDist < 5.0) { // 5m
-          curState = "LAND";
-          stateStartTime = now;
-        }
-      } else if (curState == "LAND") {
-        desiredVelZ = descentVelocitySetpoint;
-        if (measuredPos.z < groundZ + 10.0) {
-          desiredVelZ = -0.5;
-        }
-        // Jotai hienoo ku ollaa maas
-        if (measuredPos.z < groundZ + 1.0 || abs(currentVelocity.z) < 0.1 && thrust < 0.1) {
-          thrust = 0.0;
-          curState = "LANDED"; 
-        }
-      }
-      if (curState != "DEMO") {
-        double velErrorZ = desiredVelZ - currentVelocity.z;
-        double thrustAdjust = pidUpdate(velErrorZ, 0.0, 0.25, 0.12, 0.04, zVelIntegral, zVelLastErr);
-        thrust = hoverThrust + thrustAdjust;
-
-        double tilt = sqrt(roll*roll + pitch*pitch);
-        if (cos(tilt) > 0.01) {
-          thrust /= cos(tilt);
-        }
-        thrust = constrain(thrust, 0.0, 0.65);
-      }else {thrust = hoverThrust; }
-    }
-    // Motor mixing
     double m1=thrust-rollOut+pitchOut+yawOut;
     double m2=thrust+rollOut-pitchOut+yawOut;
     double m3=thrust+rollOut+pitchOut-yawOut;
@@ -526,33 +227,35 @@ void loop(){
     motor3_pwm=constrain(m3*1000+1000,1000,2000);
     motor4_pwm=constrain(m4*1000+1000,1000,2000);
 
-    tLib.motors.set(1, motor1_pwm);
-    tLib.motors.set(2, motor2_pwm);
-    tLib.motors.set(3, motor3_pwm);
-    tLib.motors.set(4, motor4_pwm);
-
-    tLib.update();
-    // Debug prints
-    Serial.print("State: "); Serial.println(curState);
-
-    Serial.print("Roll: ");Serial.print(roll);
-    Serial.print(" Pitch: ");Serial.print(pitch);
-    Serial.print(" Yaw: ");Serial.println(yaw);
-
-    Serial.print("Acc X: ");Serial.print(ax);
-    Serial.print(" Acc Y: ");Serial.print(ay);
-    Serial.print(" Acc Z: ");Serial.println(az);
-
-    Serial.print("Pos Z: ");Serial.print(measuredPos.z);
-
-    Serial.print(" Vel Z: ");Serial.println(currentVelocity.z);
-
-    Serial.print("Thrust: ");Serial.println(thrust);
-
     Serial.print("Motors: ");
     Serial.print(motor1_pwm);Serial.print(" ");
     Serial.print(motor2_pwm);Serial.print(" ");
     Serial.print(motor3_pwm);Serial.print(" ");
     Serial.println(motor4_pwm);
-  }
+
+    Serial.print("Accel X: ");
+    Serial.print(ax);
+    Serial.print(" g, Y: ");
+    Serial.print(ay);
+    Serial.print(" g, Z: ");
+    Serial.println(az);
+
+    Serial.print("Gyro X: ");
+    Serial.print(gx);
+    Serial.print(" deg/s, Y: ");
+    Serial.print(gy);
+    Serial.print(" deg/s, Z: ");
+    Serial.println(gz);
+
+    Serial.print("Roll: ");
+    Serial.print(roll* (180.0 / PI));
+    Serial.print(" Pitch: ");
+    Serial.print(pitch* (180.0 / PI));
+    Serial.print(" Yaw: ");
+    Serial.println(yaw* (180.0 / PI));
+
+    tLib.update();
+
+    Serial.println("-----------------------");
+    delay(20);
 }
