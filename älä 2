@@ -325,16 +325,14 @@ static void calibrateGyro() {
 // - Update uses accel (unit vector), only corrects roll/pitch (yaw unobservable)
 // - We keep yaw damping using gyro rate in the controller to stay stable
 
-static constexpr double DEG_TO_RAD = 3.14159265358979323846 / 180.0;
-static constexpr double RAD_TO_DEG = 180.0 / 3.14159265358979323846;
-
 static double q0=1, q1=0, q2=0, q3=0;      // w,x,y,z
 static double P0=3, P1=3, P2=3;            // simple diagonal covariance proxy
 static double accelNoise=0.005;
 static double gyroNoise=0.1;
 
 // output smoothing for angles (radians)
-static double alphaAngle = 0.4;
+static double alphaAngle = 0.05;
+static double alphaPWM = 0.05;
 static double rollFiltered_rad = 0;
 static double pitchFiltered_rad = 0;
 static double yawFiltered_rad = 0;
@@ -724,7 +722,7 @@ void setup() {
   nextTelemMs = millis() + TELEMETRY_PERIOD_MS;
   setLinkState(LS_IDLE);
 }
-
+double m1,m2,m3,m4;
 void loop() {
   const uint32_t nowMs = millis();
   const uint32_t nowUs = micros();
@@ -769,9 +767,9 @@ void loop() {
   const double pitch_meas_deg = (double)pitch_deg;
 
   // ================= Angle PID (roll/pitch) =================
-  const double KP_ANG = 0.035;
-  const double KI_ANG = 0.002;
-  const double KD_ANG = 0.001;
+  const double KP_ANG = 0.025;
+  const double KI_ANG = 0.00;
+  const double KD_ANG = 0.00;
 
   double rollOut  = pidUpdate(roll_meas_deg,  0.0, KP_ANG, KI_ANG, KD_ANG, rollIntegral,  rollLastErr,  dtPid);
   double pitchOut = pidUpdate(pitch_meas_deg, 0.0, KP_ANG, KI_ANG, KD_ANG, pitchIntegral, pitchLastErr, dtPid);
@@ -792,10 +790,10 @@ void loop() {
   // m3 = -X (left)    CW
   // m4 = -Y (back)    CCW
 
-  double m1 = baseThrust - rollOut + yawOut;   // reversed roll
-  double m2 = baseThrust - pitchOut - yawOut;
-  double m3 = baseThrust + rollOut + yawOut;   // reversed roll
-  double m4 = baseThrust + pitchOut - yawOut;
+   m1 += alphaPWM * ((baseThrust - rollOut + yawOut)-m1);   // reversed roll
+   m2 += alphaPWM * ((baseThrust - pitchOut - yawOut)-m2);
+   m3 += alphaPWM * ((baseThrust + rollOut + yawOut)-m3);   // reversed roll
+   m4 += alphaPWM * ((baseThrust + pitchOut - yawOut)-m4);
 
   // ================= PWM Mapping =================
   m1_cmd_us = (uint16_t)constrain((int)(m1 * 1000.0 + 1000.0), 1000, 2000);
