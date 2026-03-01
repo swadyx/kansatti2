@@ -217,15 +217,20 @@ void loop() {
     pitchOut = pidUpdate(pitch, 0, 0.05, 0.002, 0.001, pitchIntegral, pitchLastErr);
     yawOut = pidUpdate(yaw, yaw, 0.05, 0.002, 0.001, yawIntegral, yawLastErr);
 
-    double m1=thrust-rollOut+pitchOut+yawOut;
-    double m2=thrust+rollOut-pitchOut+yawOut;
-    double m3=thrust+rollOut+pitchOut-yawOut;
-    double m4=thrust-rollOut-pitchOut-yawOut;
+    double m1 = thrust - rollOut - yawOut; // Oikea (CW)
+    double m2 = thrust - pitchOut + yawOut; // Etu   (CCW)
+    double m3 = thrust + rollOut - yawOut; // Vasen  (CW)
+    double m4 = thrust + pitchOut + yawOut; // Taka   (CCW)
+    
+    motor1_pwm = constrain(m1 * 1000 + 1000, 1000, 2000);
+    motor2_pwm = constrain(m2 * 1000 + 1000, 1000, 2000);
+    motor3_pwm = constrain(m3 * 1000 + 1000, 1000, 2000);
+    motor4_pwm = constrain(m4 * 1000 + 1000, 1000, 2000);
 
-    motor1_pwm=constrain(m1*1000+1000,1000,2000);
-    motor2_pwm=constrain(m2*1000+1000,1000,2000);
-    motor3_pwm=constrain(m3*1000+1000,1000,2000);
-    motor4_pwm=constrain(m4*1000+1000,1000,2000);
+    tLib.motors.set(1, motor1_pwm);
+    tLib.motors.set(2, motor2_pwm);
+    tLib.motors.set(3, motor3_pwm);
+    tLib.motors.set(4, motor4_pwm);
 
     Serial.print("Motors: ");
     Serial.print(motor1_pwm);Serial.print(" ");
