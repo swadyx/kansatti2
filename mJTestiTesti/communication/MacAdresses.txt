@@ -1,2 +1,2 @@
-Groundstation MAC Address: D4:D4:DA:5A:5A:74
-Satellite board (ESP32S3-sense) MAC Address: 98:A3:16:F8:27:40
+Groundstation MAC: 08:D1:F9:F4:BF:50
+Satellite board (ESP32S3-sense) MAC: 98:A3:16:F8:25:40
