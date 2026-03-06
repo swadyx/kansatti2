@@ -23,7 +23,7 @@ static constexpr float THRUST_STEP = 0.02f;  // per command
 static constexpr float THRUST_MIN  = 0.00f;
 static constexpr float THRUST_MAX  = 0.90f;  // safety cap
 
-static float baseThrust = 0.45f;
+static float baseThrust = 0.5f;
 static bool motorsArmed = false; // FALSE by default
 
 // ===================== Logging =====================
@@ -331,8 +331,7 @@ static double accelNoise=0.005;
 static double gyroNoise=0.1;
 
 // output smoothing for angles (radians)
-static double alphaAngle = 0.05;
-static double alphaPWM = 0.05;
+static double alphaAngle = 1;
 static double rollFiltered_rad = 0;
 static double pitchFiltered_rad = 0;
 static double yawFiltered_rad = 0;
@@ -462,18 +461,27 @@ static void sensorStep(uint32_t nowUs){
   gy_dps = gy - (float)gyroBiasY;
   gz_dps = gz - (float)gyroBiasZ;
 
-  // EKF predict (gyro in rad/s)
-  ekfPredict((double)gx_dps * DEG_TO_RAD,
-             (double)gy_dps * DEG_TO_RAD,
-             (double)gz_dps * DEG_TO_RAD,
-             (double)dt);
+  // rotate IMU frame → EKF body frame
+// Raw from IMU: ax=left(+), ay=forward(+), az=down(+)
+// Bias-corrected: ax_g, ay_g, az_g
 
-  // EKF update (accel in g -> unit vector inside update)
-  ekfUpdateAccel((double)ax_g, (double)ay_g, (double)az_g);
+  // Remap to standard: X=forward, Y=right, Z=down
+  // FIXED remapping for YOUR IMU (X+ = left, Y+ = forward, Z+ = down)
+  // EKF body frame now matches your mixer: X = forward, Y = right, Z = down
+  double ax_ekf =  ay_g;          // forward accel → X body (forward)
+  double ay_ekf = -ax_g;          // left accel  → negative right
+  double az_ekf =  az_g;          // down remains down (gravity +1g at level)
+
+  double gx_ekf =  gy_dps * DEG_TO_RAD;   // forward rate → X gyro
+  double gy_ekf = -gx_dps * DEG_TO_RAD;   // left rate  → negative right rate
+  double gz_ekf =  gz_dps * DEG_TO_RAD;
+
+  ekfPredict(gx_ekf, gy_ekf, gz_ekf, (double)dt);
+  ekfUpdateAccel(ax_ekf, ay_ekf, az_ekf);
 
   // quaternion -> Euler (radians)
   double roll  = atan2( q1*q0 + q2*q3 , 0.5 - q1*q1 - q2*q2 );
-  double pitch = asin ( 2.0 * (q0*q2 - q3*q1) );
+  double pitch = -1*asin ( 2.0 * (q0*q2 - q3*q1) );
   double yaw   = atan2( q1*q2 + q0*q3 , 0.5 - q2*q2 - q3*q3 );
 
   // smooth angles a bit
@@ -723,6 +731,19 @@ void setup() {
   setLinkState(LS_IDLE);
 }
 double m1,m2,m3,m4;
+static inline void getTiltError(double &errRoll, double &errPitch)
+{
+  // gravity vector from quaternion (in body frame X=forward, Y=right, Z=down)
+  double gx = 2.0 * (q1*q3 + q0*q2);   // gravity forward (nose-down tilt)
+  double gy = 2.0 * (q2*q3 - q0*q1);   // gravity right   (right-down tilt)
+
+  // Signs matched to your 4 tilt pictures + motor PWM changes:
+  // Tilt nose down (m2) → front motors must drop, back must rise
+  // Tilt right down (m1) → right motor (m1) must rise, left (m3) must drop
+  errRoll  =  -gy;   // positive = gravity right → roll left (lift right)
+  errPitch =  gx;   // positive = gravity forward → pitch up (lift back)
+}
+
 void loop() {
   const uint32_t nowMs = millis();
   const uint32_t nowUs = micros();
@@ -763,24 +784,45 @@ void loop() {
   const double yawRate_dps = (double)gz_f;
 
   // EKF angles are in global roll_deg/pitch_deg/yaw_deg (degrees)
-  const double roll_meas_deg  = (double)roll_deg;
-  const double pitch_meas_deg = (double)pitch_deg;
 
-  // ================= Angle PID (roll/pitch) =================
-  const double KP_ANG = 0.025;
-  const double KI_ANG = 0.00;
-  const double KD_ANG = 0.00;
 
-  double rollOut  = pidUpdate(roll_meas_deg,  0.0, KP_ANG, KI_ANG, KD_ANG, rollIntegral,  rollLastErr,  dtPid);
-  double pitchOut = pidUpdate(pitch_meas_deg, 0.0, KP_ANG, KI_ANG, KD_ANG, pitchIntegral, pitchLastErr, dtPid);
+// ================= TILT CONTROL (NO EULERS) =================
+
+double errRoll, errPitch;
+getTiltError(errRoll, errPitch);
+
+// PID gains in "tilt units" (not degrees)
+const double KP_TILT = 0.018;     // start here
+const double KI_TILT = 0.0;
+const double KD_TILT = 0.008;
+
+// derivative using gyro (physically correct damping)
+double rollRate  = gx_f * DEG_TO_RAD;  // rotation around right axis
+double pitchRate = gy_f * DEG_TO_RAD;  // rotation around front axis
+
+rollIntegral  += errRoll  * dtPid;
+pitchIntegral += errPitch * dtPid;
+
+rollIntegral  = constrain(rollIntegral,  -0.3, 0.3);
+pitchIntegral = constrain(pitchIntegral, -0.3, 0.3);
+
+double rollOut =
+    KP_TILT * errRoll
+  + KI_TILT * rollIntegral
+  - KD_TILT * rollRate;
+
+double pitchOut =
+    KP_TILT * errPitch
+  + KI_TILT * pitchIntegral
+  - KD_TILT * pitchRate;
 
   // ================= Yaw: simple rate damping  =================
-  const double KP_YAW_RATE = 0.0020;
+  const double KP_YAW_RATE = 0.0008;
   double yawOut = KP_YAW_RATE * (0.0 - yawRate_dps);
 
   // Clamp outputs (keep your previous safe clamps)
-  rollOut  = constrain(rollOut,  -0.15, 0.15);
-  pitchOut = constrain(pitchOut, -0.15, 0.15);
+  rollOut  = constrain(rollOut, -0.08, 0.08);   // max ~30 PWM
+  pitchOut = constrain(pitchOut, -0.08, 0.08);
   yawOut   = constrain(yawOut,   -0.12, 0.12);
 
   // ================= PLUS FRAME MIXER =================
@@ -790,10 +832,17 @@ void loop() {
   // m3 = -X (left)    CW
   // m4 = -Y (back)    CCW
 
-   m1 += alphaPWM * ((baseThrust - rollOut + yawOut)-m1);   // reversed roll
-   m2 += alphaPWM * ((baseThrust - pitchOut - yawOut)-m2);
-   m3 += alphaPWM * ((baseThrust + rollOut + yawOut)-m3);   // reversed roll
-   m4 += alphaPWM * ((baseThrust + pitchOut - yawOut)-m4);
+  static double rollOutFilt=0, pitchOutFilt=0;
+  rollOutFilt  += 0.1 * (rollOut  - rollOutFilt);
+  pitchOutFilt += 0.1 * (pitchOut - pitchOutFilt);
+double temp_roll  = pitchOutFilt;     // original pitch command becomes new roll
+  double temp_pitch = -rollOutFilt;      // original roll command becomes new pitch
+
+  // Now apply INVERTED signs so thrust increases on the low side
+  m1 = baseThrust + temp_roll  + yawOut;   // right   ↑ when right needs lift
+  m2 = baseThrust + temp_pitch - yawOut;   // front   ↑ when front needs lift
+  m3 = baseThrust - temp_roll  + yawOut;   // left    ↑ when left needs lift
+  m4 = baseThrust - temp_pitch - yawOut;   // back    ↑ when back needs lift
 
   // ================= PWM Mapping =================
   m1_cmd_us = (uint16_t)constrain((int)(m1 * 1000.0 + 1000.0), 1000, 2000);
