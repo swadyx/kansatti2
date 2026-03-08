@@ -327,7 +327,7 @@ static void calibrateGyro() {
 
 static double q0=1, q1=0, q2=0, q3=0;      // w,x,y,z
 static double P0=3, P1=3, P2=3;            // simple diagonal covariance proxy
-static double accelNoise=0.005;
+static double accelNoise=0.1;
 static double gyroNoise=0.1;
 
 // output smoothing for angles (radians)
@@ -440,6 +440,7 @@ static void sensorStep(uint32_t nowUs){
 
   // read sensors
   tLib.imu.readAccel(ax, ay, az); // g
+
   tLib.imu.readGyro(gx, gy, gz);  // dps
 
   // accel bias corrected (g) for EKF update & telemetry
@@ -792,13 +793,13 @@ double errRoll, errPitch;
 getTiltError(errRoll, errPitch);
 
 // PID gains in "tilt units" (not degrees)
-const double KP_TILT = 0.018;     // start here
+const double KP_TILT = 0.07;
 const double KI_TILT = 0.0;
 const double KD_TILT = 0.008;
 
 // derivative using gyro (physically correct damping)
-double rollRate  = gx_f * DEG_TO_RAD;  // rotation around right axis
-double pitchRate = gy_f * DEG_TO_RAD;  // rotation around front axis
+double rollRate  = gx_f * DEG_TO_RAD;
+double pitchRate = gy_f * DEG_TO_RAD;
 
 rollIntegral  += errRoll  * dtPid;
 pitchIntegral += errPitch * dtPid;
@@ -821,8 +822,8 @@ double pitchOut =
   double yawOut = KP_YAW_RATE * (0.0 - yawRate_dps);
 
   // Clamp outputs (keep your previous safe clamps)
-  rollOut  = constrain(rollOut, -0.08, 0.08);   // max ~30 PWM
-  pitchOut = constrain(pitchOut, -0.08, 0.08);
+  rollOut  = constrain(rollOut, -0.25, 0.25);
+  pitchOut = constrain(pitchOut, -0.25, 0.25);
   yawOut   = constrain(yawOut,   -0.12, 0.12);
 
   // ================= PLUS FRAME MIXER =================
