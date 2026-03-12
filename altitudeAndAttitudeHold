@@ -76,8 +76,8 @@ static float altPrevError = 0.0f;
 static constexpr uint32_t ALT_PERIOD_US = 20000; // 50 Hz
 static uint32_t lastAltUs = 0;
 
-static float groundPressure = 1013.25f;
-static float pressureFiltered = 1013.25f;
+static float groundPressure = 101325.0f;
+static float pressureFiltered = 101325.0f;
 
 // ===================== Logging =====================
 static void logLine(const char* msg) {
@@ -439,7 +439,7 @@ static void sensorStep(uint32_t nowUs){
 static uint8_t telemSeq = 0;
 static uint32_t nextTelemMs = 0;
 
-static void buildTelemetry(uint8_t* p /*32 bytes*/) {
+static void buildTelemetry(uint8_t* p /*34 bytes*/) {
   auto put_i16 = [&](int idx, int16_t v) {
     p[idx + 0] = (uint8_t)(v & 0xFF);
     p[idx + 1] = (uint8_t)((v >> 8) & 0xFF);
@@ -467,6 +467,8 @@ static void buildTelemetry(uint8_t* p /*32 bytes*/) {
   uint16_t lipo_mV = (uint16_t)(tLib.vlipo.readVoltage() * 1000.0f);
   uint16_t thrust_permille = clamp_u16((int32_t)lroundf(baseThrust * 1000.0f));
 
+  int16_t alt_cm = clamp_i16((int32_t)lroundf(altitudeFiltered * 100.0f));
+
   put_i16( 2, ax_mg);
   put_i16( 4, ay_mg);
   put_i16( 6, az_mg);
@@ -478,11 +480,11 @@ static void buildTelemetry(uint8_t* p /*32 bytes*/) {
   put_i16(18, yaw_cdeg);
   put_u16(20, lipo_mV);
   put_u16(22, thrust_permille);
-
   put_u16(24, m1_cmd_us);
   put_u16(26, m2_cmd_us);
   put_u16(28, m3_cmd_us);
   put_u16(30, m4_cmd_us);
+  put_i16(32, alt_cm);
 }
 
 // ===================== Commands (NO ACKS) =====================
@@ -594,7 +596,7 @@ static void linkStep(uint32_t nowMs) {
       break;
 
     case LS_TX_TELEM: {
-      uint8_t p[32];
+      uint8_t p[34];
       buildTelemetry(p);
       radioTx(p, sizeof(p));
       setLinkState(LS_WAIT_TXDONE);
@@ -638,8 +640,11 @@ void setup() {
   calibrateGyro();
   Serial.println("[AIR] Calibration done.");
 
-  // initialize barometer reference
   groundPressure = tLib.baro.readPressure();
+  while (!isfinite(groundPressure) || groundPressure < 80000.0f || groundPressure > 110000.0f) {
+    delay(10);
+    groundPressure = tLib.baro.readPressure();
+  }
   pressureFiltered = groundPressure;
 
   initState = I_IDLE;
@@ -751,8 +756,11 @@ void loop() {
       altitudeTarget = 0.0f;
     }
 
-    // --- PI controller ---
+    // --- Baro read with NaN/range guard (Pa) ---
     float pressure = tLib.baro.readPressure();
+    if (!isfinite(pressure) || pressure < 80000.0f || pressure > 110000.0f) {
+      pressure = pressureFiltered;
+    }
 
     pressureFiltered += 0.1f * (pressure - pressureFiltered);
 
@@ -760,9 +768,11 @@ void loop() {
         44330.0f *
         (1.0f - powf(pressureFiltered / groundPressure, 0.1903f));
 
+    altitudeFiltered = altitude;
+
     float altError = altitudeTarget - altitude;
 
-    altIntegral += altError * 0.02f; // dt = 0.02 s
+    altIntegral += altError * 0.02f;
     altIntegral = clamp_f(altIntegral, -0.3f, 0.3f);
 
     float altOutput =
