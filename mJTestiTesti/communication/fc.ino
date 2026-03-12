@@ -1,15 +1,16 @@
 #include <Tonttulib.h>
+#include "protocol.h"
 
 Tonttulib tLib;
 
-int num = 0;
+int32_t num = 0;
 float lat = 61.2953;
 float lon = 23.4539;
 String state = "not armed";
 
 void setup() {
     Serial.begin(115200);
-    Serial1.begin(900000);
+    Serial1.begin(921600);
 
     int status = tLib.init();
     if (status != 1) {
@@ -19,7 +20,12 @@ void setup() {
     }
 }
 
-void handleCommand(String cmd) {
+void handleCommand(const Command &c) {
+    // Safely construct String in case cmd is not null-terminated
+    char buf[sizeof(c.cmd) + 1];
+    memcpy(buf, c.cmd, sizeof(c.cmd));
+    buf[sizeof(c.cmd)] = '\0';
+    String cmd = String(buf);
     cmd.trim();
 
     if (cmd == "arm") {
@@ -33,29 +39,27 @@ void handleCommand(String cmd) {
     } else {
         Serial.print("Unknown cmd -> ");
         Serial.println(cmd);
-        // REMOVED: don't send non-CSV text on Serial1, it corrupts the data stream
     }
 }
 
 void loop() {
-    // Check for commands FIRST
-    while (Serial1.available()) {
-        String cmd = Serial1.readStringUntil('\n');
+    // Check for commands from bridge
+    Command cmd;
+    while (receivePacket(Serial1, cmd)) {
         handleCommand(cmd);
     }
 
     float pressure = tLib.baro.readPressure();
 
-    // Send CSV data to bridge
-    Serial1.print(pressure);
-    Serial1.print(",");
-    Serial1.print(num);
-    Serial1.print(",");
-    Serial1.print(state);
-    Serial1.print(",");
-    Serial1.print(lat, 6);
-    Serial1.print(",");
-    Serial1.println(lon, 6);
+    // Send sensor data to bridge as binary
+    SensorData sd;
+    sd.pressure = pressure;
+    sd.num      = num;
+    strncpy(sd.state, state.c_str(), sizeof(sd.state));
+    sd.state[sizeof(sd.state) - 1] = '\0';
+    sd.lat = lat;
+    sd.lon = lon;
+    sendPacket(Serial1, sd);
 
     Serial.print("Pressure: ");
     Serial.print(pressure);
