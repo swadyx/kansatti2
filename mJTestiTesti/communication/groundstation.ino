@@ -3,6 +3,7 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include "protocol.h"
 
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
@@ -12,18 +13,6 @@
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 uint8_t bridgeMAC[] = {0x98, 0xA3, 0x16, 0xF8, 0x25, 0x40}; // esp32s3 macci
-
-struct SensorData {
-    float pressure;
-    int num;
-    char state[16];
-    float lat;
-    float lon;
-};
-
-struct Command {
-    char cmd[32];
-};
 
 esp_now_peer_info_t peerInfo;
 
