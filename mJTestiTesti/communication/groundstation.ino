@@ -1,249 +1,150 @@
-/*
- * CanSat Ground Station - ESP32-WROOM
- * Receives telemetry, sends commands & text messages
- */
-
 #include <esp_now.h>
 #include <WiFi.h>
-#include "esp_wifi.h"
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 
-// Drone mac
-uint8_t droneMAC[] = {0x98, 0xA3, 0x16, 0xF8, 0x27, 0x40};
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+#define OLED_ADDR 0x3C  // try 0x3D if this doesn't work
 
-// pitää olla sama ku dronen lähettämä paketti
-typedef struct __attribute__((packed)) {
-  uint32_t timestamp;
-  uint8_t  packetType;
-  uint16_t packetId;
-  float    altitude;
-  float    temperature;
-  float    pressure;
-  float    latitude;
-  float    longitude;
-  float    accelX, accelY, accelZ;
-  float    gyroX, gyroY, gyroZ;
-  float    batteryVoltage;
-  uint8_t  droneState;
-  uint8_t  gpsFixQuality;
-  int8_t   rssi;
-  uint32_t photoCount;
-  uint8_t  sdOK;
-  uint8_t  camOK;
-} TelemetryPacket;
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-typedef struct __attribute__((packed)) {
-  uint8_t  packetType;     // 0x10 emt mikä tää on en väitä vastaan claudelle
-  uint8_t  commandType;
-  uint8_t  param1;
-  uint8_t  param2;
-  uint32_t timestamp;
-} CommandPacket;
+uint8_t bridgeMAC[] = {0x98, 0xA3, 0x16, 0xF8, 0x25, 0x40}; // esp32s3 macci
 
-TelemetryPacket telem;
+struct SensorData {
+    float pressure;
+    int num;
+    char state[16];
+    float lat;
+    float lon;
+};
 
-uint32_t packetsReceived = 0;
-uint32_t packetsLost = 0;
-uint16_t lastPacketId = 0;
-unsigned long lastPacketTime = 0;
-int8_t lastRssi = 0;
-bool peerAdded = false;
-// eri statet
-const char* stateName(uint8_t s) {
-  switch (s) {
-    case 0: return "OFF";
-    case 1: return "IDLE";
-    case 2: return "LAUNCH";
-    case 3: return "PAUSED";
-    case 4: return "MOTOR_TEST";
-    default: return "???";
-  }
+struct Command {
+    char cmd[32];
+};
+
+esp_now_peer_info_t peerInfo;
+
+SensorData latest;
+bool dataReceived = false;
+
+void onDataRecv(const esp_now_recv_info *info, const uint8_t *data, int len) {
+    if (len == sizeof(SensorData)) {
+        memcpy(&latest, data, sizeof(latest));
+        dataReceived = true;
+    }
 }
 
-void onDataSent(const wifi_tx_info_t *tx_info, esp_now_send_status_t status) {
-  Serial.printf("[TX] %s\n", status == ESP_NOW_SEND_SUCCESS ? "Delivered" : "FAILED");
+void onDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status) {
+    Serial.print("Sent to: ");
+    for (int i = 0; i < 6; i++) {
+        Serial.printf("%02X", info->des_addr[i]);
+        if (i < 5) Serial.print(":");
+    }
+    Serial.print(" -> ");
+    Serial.println(status == ESP_NOW_SEND_SUCCESS ? "OK" : "FAIL");
 }
 
-void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
-  lastPacketTime = millis();
-  lastRssi = info->rx_ctrl->rssi;
+void updateDisplay() {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
 
-  if (len == sizeof(TelemetryPacket) && data[4] == 0x01) {
-    memcpy(&telem, data, sizeof(telem));
+    display.setCursor(0, 0);
+    display.print("P: ");
+    display.print(latest.pressure, 1);
+    display.println(" Pa");
 
-    // träkätää et onko paketteja kadonnu matkalla :D
-    if (packetsReceived > 0 && telem.packetId > lastPacketId + 1) {
-      packetsLost += (telem.packetId - lastPacketId - 1);
-    }
-    lastPacketId = telem.packetId;
-    packetsReceived++;
-// joka neljäs paketti printataa atm
-    if (packetsReceived % 4 == 0) {
-      printTelemetry();
-    }
-  }
-}
+    display.setCursor(0, 12);
+    display.print("N: ");
+    display.println(latest.num);
 
-void printTelemetry() {
-  float loss = (packetsReceived + packetsLost) > 0 
-    ? (float)packetsLost / (packetsReceived + packetsLost) * 100.0 : 0;
-// pimee chart joka printataa
-  Serial.println("═══════════════════════════════════════════════════════════════════");
-  Serial.printf("PKT:%05d | T:%8lums | %-10s | RSSI:%4ddBm | LOSS:%.1f%% | RX:%lu\n",
-    telem.packetId, telem.timestamp, stateName(telem.droneState),
-    lastRssi, loss, packetsReceived);
-  Serial.printf("ALT:%7.1fm | LAT:%11.6f | LON:%11.6f | TEMP:%.1fC | PRES:%.1fhPa\n",
-    telem.altitude, telem.latitude, telem.longitude,
-    telem.temperature, telem.pressure);
-  Serial.printf("ACC: X=%.2f Y=%.2f Z=%.2f | GYRO: X=%.2f Y=%.2f Z=%.2f\n",
-    telem.accelX, telem.accelY, telem.accelZ,
-    telem.gyroX, telem.gyroY, telem.gyroZ);
-  Serial.printf("BATT:%.2fV | GPS:%d | PHOTOS:%lu | SD:%s | CAM:%s\n",
-    telem.batteryVoltage, telem.gpsFixQuality, telem.photoCount,
-    telem.sdOK ? "OK" : "X", telem.camOK ? "OK" : "X");
-}
+    display.setCursor(0, 24);
+    display.print("S: ");
+    display.println(latest.state);
 
-// commandie lähettämine tätä pitää työstää viel paremmaks
-void sendCommand(uint8_t cmdType, uint8_t p1, uint8_t p2) {
-  if (!peerAdded) { Serial.println("[ERR] No peer"); return; }
+    display.setCursor(0, 36);
+    display.print("Lat: ");
+    display.println(latest.lat, 6);
 
-  CommandPacket cmd;
-  cmd.packetType  = 0x10;
-  cmd.commandType = cmdType;
-  cmd.param1      = p1;
-  cmd.param2      = p2;
-  cmd.timestamp   = millis();
+    display.setCursor(0, 48);
+    display.print("Lon: ");
+    display.println(latest.lon, 6);
 
-  esp_now_send(droneMAC, (uint8_t *)&cmd, sizeof(cmd));
-  Serial.printf("[TX] Command 0x%02X p1=%d p2=%d\n", cmdType, p1, p2);
-}
-
-// poista enne lentoo tää on paskane debug juttu et voidaa lähettää perus viestejä
-void sendMessage(const char *msg) {
-  if (!peerAdded) { Serial.println("[ERR] No peer"); return; }
-
-  int msgLen = strlen(msg);
-  if (msgLen > 199) msgLen = 199;
-
-  uint8_t buf[201];
-  buf[0] = 0x20;  // packetType = text message
-  memcpy(buf + 1, msg, msgLen);
-  buf[msgLen + 1] = '\0';
-
-  esp_now_send(droneMAC, buf, msgLen + 2);
-  Serial.printf("[TX] Message: \"%s\"\n", msg);
-}
-
-// fifi päälle
-void setupESPNow() {
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect();
-  esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_LR);
-  esp_wifi_set_max_tx_power(84);
-  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
-
-  if (esp_now_init() != ESP_OK) {
-    Serial.println("[ERR] ESP-NOW init failed");
-    return;
-  }
-  esp_now_register_send_cb(onDataSent);
-  esp_now_register_recv_cb(onDataRecv);
-
-  esp_now_peer_info_t peer = {};
-  memcpy(peer.peer_addr, droneMAC, 6);
-  peer.channel = 1;
-  peer.encrypt = false;
-  peerAdded = (esp_now_add_peer(&peer) == ESP_OK);
-  Serial.printf("[ESP-NOW] Peer: %s\n", peerAdded ? "OK" : "FAIL");
-}
-
-void processSerial() {
-  if (!Serial.available()) return;
-
-  String input = Serial.readStringUntil('\n');
-  input.trim();
-  if (input.length() == 0) return;
-
-  // komennot alkaa / merkillä esim /off /pause /on /test
-  if (input.startsWith("/")) {
-    String cmd = input.substring(1);
-
-    if (cmd == "on") {
-      sendCommand(0x01, 0, 0);
-    }
-    else if (cmd == "off") {
-      sendCommand(0x02, 0, 0);
-    }
-    else if (cmd == "launch") {
-      sendCommand(0x03, 0, 0);
-    }
-    else if (cmd == "pause") {
-      sendCommand(0x04, 0, 0);
-    }
-    else if (cmd.startsWith("motor ")) {
-      // /motor 1 50  →  mootori 1 on  50% päällä joku pimee pitää poistaa ainaki enne lentoo ettei käy incident
-      // pimeet gpt jutut ei oikee onnistunu iteltä
-      int space = cmd.indexOf(' ', 6);
-      if (space > 0) {
-        int motor = cmd.substring(6, space).toInt();
-        int power = cmd.substring(space + 1).toInt();
-        sendCommand(0x05, motor, power);
-      } else {
-        Serial.println("Usage: /motor <n> <power%>");
-      }
-    }
-    else if (cmd == "status") {
-      Serial.printf("\n--- STATUS ---\n");
-      Serial.printf("RX: %lu | Lost: %lu | Last: %lums ago\n",
-        packetsReceived, packetsLost, millis() - lastPacketTime);
-      Serial.printf("--------------\n\n");
-    }
-    else if (cmd == "help") {
-      Serial.println("\n=== COMMANDS (prefix with /) ===");
-      Serial.println("  /on              Power on drone");
-      Serial.println("  /off             Power off drone");
-      Serial.println("  /launch          Launch sequence");
-      Serial.println("  /pause           Pause drone");
-      Serial.println("  /motor <n> <p>   Test motor n at p%");
-      Serial.println("  /status          Connection status");
-      Serial.println("  /help            This help");
-      Serial.println("\n=== TEXT MESSAGES ===");
-      Serial.println("  Just type anything without / prefix");
-      Serial.println("  It will print on drone's Serial console\n");
-    }
-    else {
-      Serial.printf("Unknown command: /%s (type /help)\n", cmd.c_str());
-    }
-  }
-  else {
-    // Plain text → send as debug message to drone
-    sendMessage(input.c_str());
-  }
+    display.display();
 }
 
 void setup() {
-  Serial.begin(115200);
-  delay(1000);
+    Serial.begin(115200);
 
-  Serial.println("\n============================");
-  Serial.println("  CANSAT GROUND STATION v2.0");
-  Serial.println("============================");
-  Serial.printf("MAC: %s\n", WiFi.macAddress().c_str());
+    if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+        Serial.println("OLED init failed!");
+        while (true);
+    }
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.println("Ground Station");
+    display.println("Waiting for data...");
+    display.display();
 
-  setupESPNow();
+    WiFi.mode(WIFI_STA);
 
-  Serial.println("\nType /help for commands");
-  Serial.println("Type anything else to send text to drone\n");
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("ESP-NOW init failed!");
+        while (true);
+    }
+
+    esp_now_register_recv_cb(onDataRecv);
+    esp_now_register_send_cb(onDataSent);
+
+    memcpy(peerInfo.peer_addr, bridgeMAC, 6);
+    peerInfo.channel = 0;
+    peerInfo.encrypt = false;
+
+    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+        Serial.println("Failed to add peer!");
+        while (true);
+    }
+
+    Serial.println("Ground station ready");
+    Serial.println("Commands: arm, disarm, ping");
 }
 
-// ===== LOOP =====
 void loop() {
-  processSerial();
+    if (dataReceived) {
+        updateDisplay();
 
-// tulee warning jos dataloss tai connectionerror
-  if (packetsReceived > 0 && millis() - lastPacketTime > 5000) {
-    Serial.println("[WARN] No telemetry for 5 seconds");
-    lastPacketTime = millis();
-  }
+        Serial.print("P:");
+        Serial.print(latest.pressure);
+        Serial.print(" N:");
+        Serial.print(latest.num);
+        Serial.print(" S:");
+        Serial.print(latest.state);
+        Serial.print(" Lat:");
+        Serial.print(latest.lat, 6);
+        Serial.print(" Lon:");
+        Serial.println(latest.lon, 6);
 
-  delay(10); // ettei stuckaa jos full loop
+        dataReceived = false;
+    }
+
+    if (Serial.available()) {
+        String input = Serial.readStringUntil('\n');
+        input.trim();
+
+        if (input.length() > 0) {
+            Command c;
+            strncpy(c.cmd, input.c_str(), sizeof(c.cmd));
+            c.cmd[sizeof(c.cmd) - 1] = '\0';
+
+            esp_now_send(bridgeMAC, (uint8_t *)&c, sizeof(c));
+
+            Serial.print("Sent command: ");
+            Serial.println(c.cmd);
+        }
+    }
 }
