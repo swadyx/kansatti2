@@ -110,12 +110,17 @@ static double lastPosX = 0;
 static double lastPosY = 0;
 static uint32_t lastGpsTime = 0;
 
+// ==== acc drift dampening ===
+static float velEstX = 0;
+static float velEstY = 0;
+
 // ===== POSITION LOOP (GPS) =====
 static constexpr float POS_KP = 0.4f;    // position → velocity
 static constexpr float MAX_VEL = 1.0f;   // m/s
 
 // ===== VELOCITY LOOP =====
 static constexpr float VEL_KP = 4.0f;    // velocity → angle
+static constexpr float VEL_DAMP_K = 1.5f;
 static constexpr float MAX_ANGLE_GPS = 10.0f; // deg
 
 // ===================== Logging =====================
@@ -478,7 +483,7 @@ static void sensorStep(uint32_t nowUs){
 static uint8_t telemSeq = 0;
 static uint32_t nextTelemMs = 0;
 
-static void buildTelemetry(uint8_t* p /*32 bytes*/) {
+  static void buildTelemetry(uint8_t* p /*34 bytes*/) {
   auto put_i16 = [&](int idx, int16_t v) {
     p[idx + 0] = (uint8_t)(v & 0xFF);
     p[idx + 1] = (uint8_t)((v >> 8) & 0xFF);
@@ -505,6 +510,7 @@ static void buildTelemetry(uint8_t* p /*32 bytes*/) {
 
   uint16_t lipo_mV = (uint16_t)(tLib.vlipo.readVoltage() * 1000.0f);
   uint16_t thrust_permille = clamp_u16((int32_t)lroundf(baseThrust * 1000.0f));
+  int16_t alt_cm = clamp_i16((int32_t)lroundf(altitudeFiltered * 100.0f));
 
   put_i16( 2, ax_mg);
   put_i16( 4, ay_mg);
@@ -522,6 +528,7 @@ static void buildTelemetry(uint8_t* p /*32 bytes*/) {
   put_u16(26, m2_cmd_us);
   put_u16(28, m3_cmd_us);
   put_u16(30, m4_cmd_us);
+  put_i16(32, alt_cm);
 }
 
 // ===================== Commands (NO ACKS) =====================
@@ -633,7 +640,7 @@ static void linkStep(uint32_t nowMs) {
       break;
 
     case LS_TX_TELEM: {
-      uint8_t p[32];
+      uint8_t p[34];
       buildTelemetry(p);
       radioTx(p, sizeof(p));
       setLinkState(LS_WAIT_TXDONE);
@@ -677,8 +684,11 @@ void setup() {
   calibrateGyro();
   Serial.println("[AIR] Calibration done.");
 
-  // initialize barometer reference
   groundPressure = tLib.baro.readPressure();
+  while (!isfinite(groundPressure) || groundPressure < 80000.0f || groundPressure > 110000.0f) {
+    delay(10);
+    groundPressure = tLib.baro.readPressure();
+  }
   pressureFiltered = groundPressure;
 
   initState = I_IDLE;
@@ -725,10 +735,19 @@ void loop() {
   static float velSpX = 0;
   static float velSpY = 0;
 
+  if (!gpsOriginSet && tLib.gps.hasFix()) {
+      lat0 = tLib.gps.latitude;
+      lon0 = tLib.gps.longitude;
+      gpsOriginSet = true;
+  }
+
   if (tLib.gps.hasNewData()) {
 
-    measuredPosX = tLib.gps.longitude;
-    measuredPosY = tLib.gps.latitude;
+    double lat = tLib.gps.latitude;
+    double lon = tLib.gps.longitude;
+
+    measuredPosX = (lon - lon0) * cos(lat0 * DEG_TO_RAD) * 111320.0;
+    measuredPosY = (lat - lat0) * 111320.0;
 
     uint32_t nowGps = millis();
     float dtGps = (nowGps - lastGpsTime) * 0.001f;
@@ -766,13 +785,37 @@ void loop() {
     const float pitchRate_dps = PITCH_RATE_SIGN * gy_f;
     const float yawRate_dps   = YAW_RATE_SIGN   * gz_f;
 
+    // ================= Acceleration to velocity drift dampening ===============
+    float accX_world =
+    ax_g * cos(pitchEst_deg * DEG_TO_RAD) +
+    az_g * sin(pitchEst_deg * DEG_TO_RAD);
+
+    float accY_world =
+        ay_g * cos(rollEst_deg * DEG_TO_RAD) +
+        az_g * sin(rollEst_deg * DEG_TO_RAD);
+
+    float dt = CTRL_PERIOD_US * 1e-6f;
+
+    velEstX += accX_world * 9.81f * dt;
+    velEstY += accY_world * 9.81f * dt;
+    velEstX *= 0.98f;
+    velEstY *= 0.98f;
+
     // ================= Outer angle loop (P only) =================
-    // ================= VELOCITY → ANGLE =================
+    // ================= VELOCITY → ANGLE ================= tää siis tekee gps liikkuminen mut IMU damppenaa liikkumist
     float rollAngleSp_deg =
-      clamp_f(VEL_KP * (velSpY - velY), -MAX_ANGLE_GPS, MAX_ANGLE_GPS);
+        clamp_f(
+            VEL_KP * (velSpY - velY)   // GPS control
+            - VEL_DAMP_K * velEstY,    // IMU damping
+            -MAX_ANGLE_GPS,
+            MAX_ANGLE_GPS);
 
     float pitchAngleSp_deg =
-      clamp_f(VEL_KP * (velSpX - velX), -MAX_ANGLE_GPS, MAX_ANGLE_GPS);
+        clamp_f(
+            VEL_KP * (velSpX - velX)
+            - VEL_DAMP_K * velEstX,
+            -MAX_ANGLE_GPS,
+            MAX_ANGLE_GPS);
 
     float yawSp_dps        = 0.0f;
 
@@ -828,6 +871,9 @@ void loop() {
 
     // --- PI controller ---
     float pressure = tLib.baro.readPressure();
+    if (!isfinite(pressure) || pressure < 80000.0f || pressure > 110000.0f) {
+      pressure = pressureFiltered;
+    }
 
     pressureFiltered += 0.1f * (pressure - pressureFiltered);
 
