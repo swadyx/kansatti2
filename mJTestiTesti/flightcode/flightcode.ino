@@ -3,12 +3,21 @@
 #include <avr/pgmspace.h>
 #include <Tonttulib.h>
 #include <math.h>
-#include "protocol.h"
 
 Tonttulib tLib;
 
 // ===================== USER SETTINGS =====================
-static constexpr uint32_t TELEMETRY_PERIOD_MS = 200;   // 5 Hz
+static constexpr uint32_t TELEMETRY_PERIOD_MS = 500;   // 2 Hz
+static constexpr uint32_t TX_DONE_TIMEOUT_MS  = 900;
+static constexpr uint32_t INIT_GAP_MS         = 200;
+static constexpr uint32_t MODE_RECHECK_MS     = 2000;
+
+// RF params (MUST match ground)
+static constexpr const char* RFCFG_CMD =
+  "AT+TEST=RFCFG,868,SF7,125,12,15,14,ON,OFF,OFF";
+
+static constexpr bool LOG_RAW_MODEM_LINES = false;
+static constexpr bool LOG_STATE_CHANGES   = true;
 
 // thrust control
 static constexpr float THRUST_STEP = 0.02f;  // per command
@@ -77,10 +86,219 @@ static void logLine(const char* msg) {
 }
 
 // ===================== Helpers =====================
+static inline int16_t clamp_i16(int32_t v) {
+  if (v < -32768) return -32768;
+  if (v >  32767) return  32767;
+  return (int16_t)v;
+}
+static inline uint16_t clamp_u16(int32_t v) {
+  if (v < 0) return 0;
+  if (v > 65535) return 65535;
+  return (uint16_t)v;
+}
 static inline float clamp_f(float x, float lo, float hi) {
   if (x < lo) return lo;
   if (x > hi) return hi;
   return x;
+}
+
+// ===================== HEX helpers =====================
+static inline char hn(uint8_t v) { return v < 10 ? char('0' + v) : char('A' + (v - 10)); }
+
+static void bytesToHex(const uint8_t* in, size_t n, char* out /*>=2n+1*/) {
+  for (size_t i = 0; i < n; i++) {
+    out[2 * i]     = hn(in[i] >> 4);
+    out[2 * i + 1] = hn(in[i] & 0xF);
+  }
+  out[2 * n] = 0;
+}
+
+static int hv(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+  if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+  return -1;
+}
+
+static bool hexToBytes(const char* hex, size_t len, uint8_t* out, size_t outMax, size_t& outLen) {
+  outLen = 0;
+  if (len % 2) return false;
+  size_t n = len / 2;
+  if (n > outMax) return false;
+  for (size_t i = 0; i < n; i++) {
+    int hi = hv(hex[2 * i]);
+    int lo = hv(hex[2 * i + 1]);
+    if (hi < 0 || lo < 0) return false;
+    out[i] = (uint8_t)((hi << 4) | lo);
+  }
+  outLen = n;
+  return true;
+}
+
+// ===================== LoRa modem parsing =====================
+static char lineBuf[260];
+static size_t lineLen = 0;
+
+static bool modeIsTest = false;
+static bool modeIsLWABP = false;
+static bool sawTxDone = false;
+
+static void sendCmd(const char* s) {
+  Serial1.print(s);
+  Serial1.print("\r\n");
+}
+
+static bool extractRxHex(const char* line, char* out, size_t outMax, size_t& outLen) {
+  const char* p = strstr(line, "+TEST: RX");
+  if (!p) return false;
+  const char* q1 = strchr(p, '"'); if (!q1) return false;
+  const char* q2 = strchr(q1 + 1, '"'); if (!q2) return false;
+  size_t L = size_t(q2 - (q1 + 1));
+  if (L + 1 > outMax) return false;
+  memcpy(out, q1 + 1, L);
+  out[L] = 0;
+  outLen = L;
+  return true;
+}
+
+// ========================================================
+// Link states  (NO ACKS)
+// ========================================================
+enum LinkState : uint8_t {
+  LS_IDLE,
+  LS_TX_TELEM,
+  LS_WAIT_TXDONE
+};
+
+static LinkState linkState = LS_IDLE;
+static void setLinkState(LinkState s);
+
+static void setLinkState(LinkState s) {
+  if (linkState == s) return;
+  linkState = s;
+  if (!LOG_STATE_CHANGES) return;
+
+  switch (s) {
+    case LS_IDLE:        logLine("STATE IDLE"); break;
+    case LS_TX_TELEM:    logLine("STATE TX_TELEM"); break;
+    case LS_WAIT_TXDONE: logLine("STATE WAIT_TXDONE"); break;
+  }
+}
+
+// ===================== Init / recovery (LoRa module) =====================
+enum InitState : uint8_t {
+  I_IDLE, I_SEND_MODEQ, I_WAIT_MODEQ, I_SEND_FDEFAULT, I_WAIT_FDEFAULT, I_SEND_RESET, I_WAIT_RESET,
+  I_SEND_MODE_TEST, I_WAIT_MODE_TEST, I_SEND_RFCFG, I_WAIT_RFCFG, I_SEND_RX, I_WAIT_RX, I_READY
+};
+
+static InitState initState = I_IDLE;
+static uint32_t initT0 = 0;
+
+static void startRecovery(uint32_t now) {
+  initState = I_SEND_MODEQ;
+  initT0 = now;
+  modeIsTest = false;
+  modeIsLWABP = false;
+  if (LOG_STATE_CHANGES) logLine("LoRa recovery start");
+}
+
+static void initStep(uint32_t now) {
+  auto waited = [&](uint32_t ms) { return (int32_t)(now - initT0) >= (int32_t)ms; };
+
+  switch (initState) {
+    case I_IDLE: startRecovery(now); break;
+
+    case I_SEND_MODEQ:
+      sendCmd("AT+MODE=?");
+      initT0 = now;
+      initState = I_WAIT_MODEQ;
+      break;
+
+    case I_WAIT_MODEQ:
+      if (modeIsTest)  { initState = I_SEND_RFCFG;    initT0 = now; break; }
+      if (modeIsLWABP) { initState = I_SEND_FDEFAULT; initT0 = now; break; }
+      if (waited(400)) initState = I_SEND_MODEQ;
+      break;
+
+    case I_SEND_FDEFAULT:
+      sendCmd("AT+FDEFAULT");
+      initT0 = now;
+      initState = I_WAIT_FDEFAULT;
+      break;
+
+    case I_WAIT_FDEFAULT:
+      if (waited(INIT_GAP_MS)) { initState = I_SEND_RESET; initT0 = now; }
+      break;
+
+    case I_SEND_RESET:
+      sendCmd("AT+RESET");
+      initT0 = now;
+      initState = I_WAIT_RESET;
+      break;
+
+    case I_WAIT_RESET:
+      if (waited(1500)) { initState = I_SEND_MODE_TEST; initT0 = now; }
+      break;
+
+    case I_SEND_MODE_TEST:
+      modeIsTest = false;
+      sendCmd("AT+MODE=TEST");
+      initT0 = now;
+      initState = I_WAIT_MODE_TEST;
+      break;
+
+    case I_WAIT_MODE_TEST:
+      if (modeIsTest) { initState = I_SEND_RFCFG; initT0 = now; break; }
+      if (waited(600)) initState = I_SEND_MODE_TEST;
+      break;
+
+    case I_SEND_RFCFG:
+      sendCmd(RFCFG_CMD);
+      initT0 = now;
+      initState = I_WAIT_RFCFG;
+      break;
+
+    case I_WAIT_RFCFG:
+      if (waited(INIT_GAP_MS)) { initState = I_SEND_RX; initT0 = now; }
+      break;
+
+    case I_SEND_RX:
+      sendCmd("AT+TEST=RXLRPKT");
+      initT0 = now;
+      initState = I_WAIT_RX;
+      break;
+
+    case I_WAIT_RX:
+      if (waited(INIT_GAP_MS)) initState = I_READY;
+      break;
+
+    case I_READY:
+      break;
+  }
+}
+
+// ===================== Radio TX helper =====================
+static uint32_t txStartMs = 0;
+
+static void radioTx(const uint8_t* p, size_t n) {
+  char hex[2 * 64 + 1];
+  bytesToHex(p, n, hex);
+
+  Serial.print("[AIR] TX ");
+  Serial.print((char)p[0]);
+  Serial.print(" len=");
+  Serial.println((int)n);
+
+  Serial1.print("AT+TEST=TXLRPKT,\"");
+  Serial1.print(hex);
+  Serial1.print("\"\r\n");
+
+  sawTxDone = false;
+  txStartMs = millis();
+}
+
+static void armRxNow() {
+  sendCmd("AT+TEST=RXLRPKT");
 }
 
 // ===================== Motors =====================
@@ -217,36 +435,182 @@ static void sensorStep(uint32_t nowUs){
   yaw_deg  += (YAW_RATE_SIGN * gz_dps) * dt;
 }
 
-// ===================== Telemetry packet =====================
-static int32_t telemNum = 0;
+// ===================== Telemetry packet (32 bytes) =====================
+static uint8_t telemSeq = 0;
 static uint32_t nextTelemMs = 0;
 
-// ===================== Commands =====================
-static void handleCommand(const Command &c) {
-  // Safely copy and null-terminate
-  char buf[sizeof(c.cmd) + 1];
-  memcpy(buf, c.cmd, sizeof(c.cmd));
-  buf[sizeof(c.cmd)] = '\0';
+static void buildTelemetry(uint8_t* p /*34 bytes*/) {
+  auto put_i16 = [&](int idx, int16_t v) {
+    p[idx + 0] = (uint8_t)(v & 0xFF);
+    p[idx + 1] = (uint8_t)((v >> 8) & 0xFF);
+  };
+  auto put_u16 = [&](int idx, uint16_t v) {
+    p[idx + 0] = (uint8_t)(v & 0xFF);
+    p[idx + 1] = (uint8_t)((v >> 8) & 0xFF);
+  };
 
-  // Strip trailing whitespace
-  size_t len = strlen(buf);
-  while (len > 0 && (buf[len - 1] == ' ' || buf[len - 1] == '\t' ||
-                     buf[len - 1] == '\r' || buf[len - 1] == '\n')) {
-    buf[--len] = '\0';
+  p[0] = 'T';
+  p[1] = telemSeq++;
+
+  int16_t ax_mg = clamp_i16((int32_t)lroundf(ax_g * 1000.0f));
+  int16_t ay_mg = clamp_i16((int32_t)lroundf(ay_g * 1000.0f));
+  int16_t az_mg = clamp_i16((int32_t)lroundf(az_g * 1000.0f));
+
+  int16_t gx_cdps = clamp_i16((int32_t)lroundf(gx_dps * 100.0f));
+  int16_t gy_cdps = clamp_i16((int32_t)lroundf(gy_dps * 100.0f));
+  int16_t gz_cdps = clamp_i16((int32_t)lroundf(gz_dps * 100.0f));
+
+  int16_t roll_cdeg  = clamp_i16((int32_t)lroundf(roll_deg  * 100.0f));
+  int16_t pitch_cdeg = clamp_i16((int32_t)lroundf(pitch_deg * 100.0f));
+  int16_t yaw_cdeg   = clamp_i16((int32_t)lroundf(yaw_deg   * 100.0f));
+
+  uint16_t lipo_mV = (uint16_t)(tLib.vlipo.readVoltage() * 1000.0f);
+  uint16_t thrust_permille = clamp_u16((int32_t)lroundf(baseThrust * 1000.0f));
+
+  int16_t alt_cm = clamp_i16((int32_t)lroundf(altitudeFiltered * 100.0f));
+
+  put_i16( 2, ax_mg);
+  put_i16( 4, ay_mg);
+  put_i16( 6, az_mg);
+  put_i16( 8, gx_cdps);
+  put_i16(10, gy_cdps);
+  put_i16(12, gz_cdps);
+  put_i16(14, roll_cdeg);
+  put_i16(16, pitch_cdeg);
+  put_i16(18, yaw_cdeg);
+  put_u16(20, lipo_mV);
+  put_u16(22, thrust_permille);
+  put_u16(24, m1_cmd_us);
+  put_u16(26, m2_cmd_us);
+  put_u16(28, m3_cmd_us);
+  put_u16(30, m4_cmd_us);
+  put_i16(32, alt_cm);
+}
+
+// ===================== Commands (NO ACKS) =====================
+static void applyCommand(uint8_t cmd) {
+  switch (cmd) {
+    case 1: tLib.led.on();        Serial.println("[AIR] LED on"); break;
+    case 2: tLib.led.off();       Serial.println("[AIR] LED off"); break;
+    case 3: tLib.led.blinkFast(); Serial.println("[AIR] LED blinkFast"); break;
+    case 4: tLib.led.blinkSlow(); Serial.println("[AIR] LED blinkSlow"); break;
+
+    case 10:
+      baseThrust = clamp_f(baseThrust + THRUST_STEP, THRUST_MIN, THRUST_MAX);
+      Serial.print("[AIR] baseThrust up -> "); Serial.println(baseThrust, 3);
+      break;
+
+    case 11:
+      baseThrust = clamp_f(baseThrust - THRUST_STEP, THRUST_MIN, THRUST_MAX);
+      Serial.print("[AIR] baseThrust down -> "); Serial.println(baseThrust, 3);
+      break;
+
+    case 12: // fly (arm)
+      motorsArmed = true;
+      Serial.println("[AIR] MOTORS ARMED (fly)");
+      break;
+
+    case 13: // stop (kill + disarm)
+      motorsArmed = false;
+      motorsSetAll(1000);
+      Serial.println("[AIR] MOTORS DISARMED + STOP");
+      break;
+
+    default:
+      Serial.println("[AIR] unknown cmd");
+      break;
+  }
+}
+
+static void handleCommandPacket(const uint8_t* p, size_t n) {
+  if (n < 3) return;
+  if (p[0] != 'C') return;
+
+  const uint8_t seq = p[1];
+  const uint8_t cmd = p[2];
+
+  Serial.print("[AIR] RX C seq="); Serial.print(seq);
+  Serial.print(" cmd="); Serial.println(cmd);
+
+  applyCommand(cmd);
+
+  (void)seq;
+}
+
+// ===================== UART line handler =====================
+static void handleRadioLine(const char* l) {
+  if (LOG_RAW_MODEM_LINES) {
+    Serial.print("[AIR][RAW] ");
+    Serial.println(l);
   }
 
-  if (strcmp(buf, "arm") == 0) {
-    motorsArmed = true;
-    Serial.println("[AIR] ARMED");
-  } else if (strcmp(buf, "disarm") == 0) {
-    motorsArmed = false;
-    motorsSetAll(1000);
-    Serial.println("[AIR] DISARMED");
-  } else if (strcmp(buf, "ping") == 0) {
-    Serial.println("PONG");
-  } else {
-    Serial.print("[AIR] unknown cmd -> ");
-    Serial.println(buf);
+  if (strstr(l, "+MODE: TEST"))  { modeIsTest = true; modeIsLWABP = false; }
+  if (strstr(l, "+MODE: LWABP")) { modeIsLWABP = true; modeIsTest = false; }
+
+  if (strstr(l, "TX") && strstr(l, "DONE")) {
+    sawTxDone = true;
+  }
+
+  char hexPayload[200];
+  size_t hexLen = 0;
+  if (extractRxHex(l, hexPayload, sizeof(hexPayload), hexLen)) {
+    uint8_t pkt[64]; size_t pktLen = 0;
+    if (!hexToBytes(hexPayload, hexLen, pkt, sizeof(pkt), pktLen)) return;
+    handleCommandPacket(pkt, pktLen);
+  }
+}
+
+static void pollRadioUart() {
+  while (Serial1.available()) {
+    char c = (char)Serial1.read();
+    if (c == '\r') continue;
+    if (c == '\n') {
+      lineBuf[lineLen] = 0;
+      handleRadioLine(lineBuf);
+      lineLen = 0;
+    } else {
+      if (lineLen + 1 < sizeof(lineBuf)) lineBuf[lineLen++] = c;
+      else lineLen = 0;
+    }
+  }
+}
+
+// ===================== Link step (NO ACKS) =====================
+static void linkStep(uint32_t nowMs) {
+  static uint32_t nextModeCheck = 0;
+  if ((int32_t)(nowMs - nextModeCheck) >= 0) {
+    sendCmd("AT+MODE=?");
+    nextModeCheck = nowMs + MODE_RECHECK_MS;
+    if (modeIsLWABP) {
+      startRecovery(nowMs);
+      setLinkState(LS_IDLE);
+      return;
+    }
+  }
+
+  switch (linkState) {
+    case LS_IDLE:
+      if ((int32_t)(nowMs - nextTelemMs) >= 0) {
+        setLinkState(LS_TX_TELEM);
+      }
+      break;
+
+    case LS_TX_TELEM: {
+      uint8_t p[34];
+      buildTelemetry(p);
+      radioTx(p, sizeof(p));
+      setLinkState(LS_WAIT_TXDONE);
+      break;
+    }
+
+    case LS_WAIT_TXDONE:
+      if (sawTxDone || (int32_t)(nowMs - txStartMs) >= (int32_t)TX_DONE_TIMEOUT_MS) {
+        sawTxDone = false;
+        armRxNow();
+        nextTelemMs = nowMs + TELEMETRY_PERIOD_MS;
+        setLinkState(LS_IDLE);
+      }
+      break;
   }
 }
 
@@ -254,7 +618,7 @@ static void handleCommand(const Command &c) {
 void setup() {
   Wire.begin();
   Serial.begin(115200);
-  Serial1.begin(921600);
+  Serial1.begin(9600);
 
   logLine("Boot");
 
@@ -283,8 +647,12 @@ void setup() {
   }
   pressureFiltered = groundPressure;
 
+  initState = I_IDLE;
+  initT0 = millis();
+
   lastImuUs = micros();
   nextTelemMs = millis() + TELEMETRY_PERIOD_MS;
+  setLinkState(LS_IDLE);
 }
 
 void loop() {
@@ -293,11 +661,11 @@ void loop() {
 
   tLib.update();
   sensorStep(nowUs);
+  pollRadioUart();
 
-  // Check for commands from bridge
-  Command cmd;
-  while (receivePacket(Serial1, cmd)) {
-    handleCommand(cmd);
+  if (initState != I_READY) {
+    initStep(nowMs);
+    return;
   }
 
   // ================= Low Voltage Cutoff =================
@@ -306,6 +674,7 @@ void loop() {
     motorsArmed = false;
     baseThrust = 0.0f;
     motorsSetAll(1000);
+    linkStep(nowMs);
     return;
   }
 
@@ -417,16 +786,6 @@ void loop() {
     );
   }
 
-  // ================= Telemetry =================
-  if ((int32_t)(nowMs - nextTelemMs) >= 0) {
-    nextTelemMs += TELEMETRY_PERIOD_MS;
-
-    SensorData sd;
-    sd.pressure = pressureFiltered;
-    sd.num      = telemNum++;
-    snprintf(sd.state, sizeof(sd.state), "%s", motorsArmed ? "ARMED" : "DISARMED");
-    sd.lat = 0.0f;
-    sd.lon = 0.0f;
-    sendPacket(Serial1, sd);
-  }
+  // ================= Radio + Link =================
+  linkStep(nowMs);
 }
