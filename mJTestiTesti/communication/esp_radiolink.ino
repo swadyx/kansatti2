@@ -10,7 +10,7 @@
 
 uint8_t groundMAC[] = {0x08, 0xD1, 0xF9, 0xF4, 0xBF, 0x50};
 
-#define RXD1 44
+#define RXD1 44 // check if valid rx and tx pins with flightcontroller
 #define TXD1 43
 
 // ── Camera pins (XIAO ESP32S3 Sense) ──
@@ -38,7 +38,7 @@ esp_now_peer_info_t peerInfo;
 int photoCount = 0;
 bool continuousCapture = false;
 unsigned long lastCaptureTime = 0;
-unsigned long captureInterval = 2000;  // ms between photos when continuous
+unsigned long captureInterval = 2000;  // ms between photos when continuous try 1000 or 700
 
 // ── Camera init ──
 bool initCamera() {
@@ -67,7 +67,7 @@ bool initCamera() {
     config.jpeg_quality = 10;               // 1-63, lower = better quality
     config.fb_count     = 1;
     config.grab_mode    = CAMERA_GRAB_LATEST;
-
+// change so the failed / ok states will be sent to ground, not flight computer
     esp_err_t err = esp_camera_init(&config);
     if (err != ESP_OK) {
         Serial.printf("Camera init failed: 0x%x\n", err);
