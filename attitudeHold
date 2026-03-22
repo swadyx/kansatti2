@@ -8,47 +8,49 @@ Tonttulib tLib;
 
 // ===================== USER SETTINGS =====================
 static constexpr uint32_t TELEMETRY_PERIOD_MS = 100;
-static constexpr float    THRUST_STEP         = 0.02f;
+static constexpr float    THRUST_STEP         = 0.005f;
 static constexpr float    THRUST_MIN          = 0.00f;
 static constexpr float    THRUST_MAX          = 0.90f;
 
-static float baseThrust  = 0.45f;
+static float baseThrust  = 0.50f;
 static bool  motorsArmed = false;
 
 // ===================== CONTROL SETTINGS =====================
-static constexpr uint32_t RATE_PERIOD_US      = 1000;   // 1000 Hz
-static constexpr uint32_t ANGLE_PERIOD_US     = 4000;   // 250 Hz
+static constexpr uint32_t RATE_PERIOD_US      = 2000;   // 1000 Hz
+static constexpr uint32_t ANGLE_PERIOD_US     = 2000;   // 250 Hz
 static constexpr float    RATE_DT             = RATE_PERIOD_US  * 1e-6f;
 static constexpr float    ANGLE_DT            = ANGLE_PERIOD_US * 1e-6f;
 static constexpr float    ANGLE_FUSE_ALPHA    = 0.985f;
 
-static constexpr float ANGLE_I_MAX        = 2;
+static constexpr float ANGLE_I_MAX        = 10;
 static constexpr float MAX_ANGLE_RATE_DPS = 400.0f;
 
-// Rate loop — low inertia means less P needed
-static float RATE_KP_ROLL       = 0.0008f;
-static float RATE_KP_PITCH      = 0.0008f;
-static float RATE_KP_YAW        = 0.0012f;
+static float RATE_KP_ROLL       = 0.00065f;
+static float RATE_KP_PITCH      = 0.00065f;
+static float RATE_KP_YAW        = 0.001f;   // recommended (not 0)
 
-// I — keep low until P is settled
-static float RATE_KI_ROLL       = 0.0f;
-static float RATE_KI_PITCH      = 0.0f;
-static float RATE_KI_YAW        = 0.0f;
+static float RATE_KI_ROLL       = 0.003f; //0,003
+static float RATE_KI_PITCH      = 0.003f; //0,003
+static float RATE_KI_YAW        = 0.001f;
 
-// D — start very small, add only after P is tuned
-static float RATE_KD_ROLL       = 0.000003f;
-static float RATE_KD_PITCH      = 0.000003f;
+static float RATE_KD_ROLL       = 0.000004f;
+static float RATE_KD_PITCH      = 0.000004f;
 static float RATE_KD_YAW        = 0.0f;
 
-// Angle loop — these are fine as-is
-static float ANGLE_KP_ROLL      = 3.0f;
-static float ANGLE_KP_PITCH     = 3.0f;
-static float ANGLE_KI_ROLL      = 0.0f;  // zero until rate loop is tuned
-static float ANGLE_KI_PITCH     = 0.0f;
+static float ANGLE_KP_ROLL      = 1.5f;
+static float ANGLE_KP_PITCH     = 1.5f;
+static float ANGLE_KI_ROLL      = 1.0f; // 2
+static float ANGLE_KI_PITCH     = 1S.0f; //2
 
-static constexpr float RATE_I_MAX = 0.15f;
+static constexpr float RATE_I_MAX = 30.0f;
 
-static constexpr float GYRO_LPF_ALPHA = 0.2f;
+static constexpr float GYRO_LPF_ALPHA = 0.4f;
+
+static float rollD_f  = 0.0f;
+static float pitchD_f = 0.0f;
+static float yawD_f   = 0.0f;
+
+static constexpr float D_LPF_ALPHA = 0.09f;  // ~30 Hz at 1 kHz
 
 static constexpr float ROLL_OUT_MAX   = 0.3f;
 static constexpr float PITCH_OUT_MAX  = 0.3f;
@@ -68,8 +70,10 @@ static inline float clamp_f(float x, float lo, float hi) {
 // ===================== Motors =====================
 static uint16_t m1_us=1000, m2_us=1000, m3_us=1000, m4_us=1000;
 static void motorsSetAll(uint16_t us) {
-    tLib.motors.set(1,us); tLib.motors.set(2,us);
-    tLib.motors.set(3,us); tLib.motors.set(4,us);
+    tLib.motors.set(1,us); 
+    tLib.motors.set(2,us);
+    tLib.motors.set(3,us); 
+    tLib.motors.set(4,us);
 }
 
 // ===================== IMU =====================
@@ -80,7 +84,7 @@ static double accelBiasX=0, accelBiasY=0, accelBiasZ=0;
 static float  rollEst=0, pitchEst=0, yawEst=0;
 static bool   angleInit = false;
 static uint32_t lastImuUs = 0;
-static constexpr uint32_t IMU_PERIOD_US = 5000;
+static constexpr uint32_t IMU_PERIOD_US = 2000;
 
 static void calibrateGyro() {
   float ogx = 0, ogy = 0, ogz = 0;
@@ -180,6 +184,8 @@ static void resetPIDState() {
     rateI_roll = rateI_pitch = rateI_yaw = 0.0f;
     rollSp = pitchSp = 0.0f;
     rollRate_prev = pitchRate_prev = yawRate_prev = 0.0f;
+    altHoldI     = 0.0f;
+    altThrustAdj = 0.0f;
 }
 
 static void sendPIDConfig() {
@@ -216,6 +222,23 @@ static void applyPIDCommand(const PIDCommand &pc) {
     sendPIDConfig();
 }
 
+// ===================== RAMP STATE =====================
+static constexpr float RAMP_DURATION_S  = 1.0f;
+static constexpr float RAMP_START_NORM  = 0;   // 1200 µs = (1200-1000)/1000
+static bool     rampActive  = false;
+static uint32_t rampStartUs = 0;
+
+static inline float rampThrust(uint32_t nowUs) {
+    if (!rampActive) return baseThrust;
+    float elapsed = (nowUs - rampStartUs) * 1e-6f;
+    if (elapsed >= RAMP_DURATION_S) {
+        rampActive = false;
+        return baseThrust;
+    }
+    float t = elapsed / RAMP_DURATION_S;                          // 0 → 1
+    return RAMP_START_NORM + t * (baseThrust - RAMP_START_NORM);  // 0.2 → baseThrust
+}
+
 // ===================== Commands =====================
 static uint8_t stringToCmd(const char* s) {
     if (strcmp(s,"arm")     == 0) return 12;
@@ -240,7 +263,16 @@ static void applyCommand(uint8_t cmd) {
         case 11:
             baseThrust = clamp_f(baseThrust-THRUST_STEP, THRUST_MIN, THRUST_MAX);
             Serial.print("[FC] thrust- "); Serial.println(baseThrust,3); break;
-        case 12: motorsArmed = true;  Serial.println("[FC] ARMED");   break;
+        case 12:
+            motorsArmed    = true;
+            rampActive     = true;
+            rampStartUs    = micros();
+            rollRate_prev  = pitchRate_prev = yawRate_prev = 0.0f;
+            resetPIDState();
+            altHoldInit();           // <-- add this
+            Serial.println("[FC] ARMED — ramping");
+            break;
+    break;
         case 13:
             motorsArmed = false; motorsSetAll(1000);
             Serial.println("[FC] DISARMED"); break;
@@ -284,7 +316,7 @@ static void sendTelemetry() {
 // ===================== Setup / Loop =====================
 void setup() {
     Wire.begin();
-    Serial.begin(115200);
+    Serial.begin(2000000);  // was 115200
     Serial1.begin(921600, SERIAL_8N1);
     Serial.println("[FC] Boot");
 
@@ -312,6 +344,7 @@ void loop() {
 
     tLib.update();
     sensorStep(nowUs);
+    altHoldStep(nowMs);
 
     // Single dispatcher — handles Command and PIDCommand frofam the same stream
     {
@@ -335,21 +368,27 @@ void loop() {
         motorsArmed = false; baseThrust = 0.0f; motorsSetAll(1000);
     }
 
+    if (fabs(rollEst) > 30 || fabs(pitchEst) > 30) {
+        motorsArmed = false;
+    }
+
     static uint32_t lastRateUs  = 0;
     static uint32_t lastAngleUs = 0;
 
     if (!lastRateUs)  lastRateUs  = nowUs;
     if (!lastAngleUs) lastAngleUs = nowUs;
 
-    // Angle loop — 250 Hz
+    // Angle loop
     if ((int32_t)(nowUs - lastAngleUs) >= (int32_t)ANGLE_PERIOD_US) {
         lastAngleUs += ANGLE_PERIOD_US;
 
         float angleErr_roll  = rollEst;
         float angleErr_pitch = pitchEst;
 
-        angleI_roll  = clamp_f(angleI_roll  + angleErr_roll  * ANGLE_DT, -ANGLE_I_MAX, ANGLE_I_MAX);
-        angleI_pitch = clamp_f(angleI_pitch + angleErr_pitch * ANGLE_DT, -ANGLE_I_MAX, ANGLE_I_MAX);
+        if (motorsArmed && !rampActive) {
+            angleI_roll  = clamp_f(angleI_roll  + angleErr_roll  * ANGLE_DT, -ANGLE_I_MAX, ANGLE_I_MAX);
+            angleI_pitch = clamp_f(angleI_pitch + angleErr_pitch * ANGLE_DT, -ANGLE_I_MAX, ANGLE_I_MAX);
+        }
 
         rollSp  = clamp_f(ANGLE_KP_ROLL  * angleErr_roll  + ANGLE_KI_ROLL  * angleI_roll,
                           -MAX_ANGLE_RATE_DPS, MAX_ANGLE_RATE_DPS);
@@ -357,52 +396,72 @@ void loop() {
                           -MAX_ANGLE_RATE_DPS, MAX_ANGLE_RATE_DPS);
     }
 
-    // Rate loop — 1000 Hz
+    // Rate loop
     if ((int32_t)(nowUs - lastRateUs) >= (int32_t)RATE_PERIOD_US) {
         lastRateUs += RATE_PERIOD_US;
 
+        // --- Gyro LPF ---
         static float gx_f=0, gy_f=0, gz_f=0;
         gx_f += GYRO_LPF_ALPHA*(gx_dps-gx_f);
         gy_f += GYRO_LPF_ALPHA*(gy_dps-gy_f);
         gz_f += GYRO_LPF_ALPHA*(gz_dps-gz_f);
 
-        float rollRate  = ROLL_RATE_SIGN  * gx_f;
-        float pitchRate = PITCH_RATE_SIGN * gy_f;
-        float yawRate   = YAW_RATE_SIGN   * gz_f;
+        static float rollRate=0, pitchRate=0, yawRate=0;
+        rollRate  = ROLL_RATE_SIGN  * gx_f;
+        pitchRate = PITCH_RATE_SIGN * gy_f;
+        yawRate   = YAW_RATE_SIGN   * gz_f;
 
-        float rateErr_roll  = rollSp  - rollRate;
-        float rateErr_pitch = pitchSp - pitchRate;
-        float rateErr_yaw   = 0.0f    - yawRate;
+        // --- Rate errors ---
+        static float rateErr_roll=0, rateErr_pitch=0, rateErr_yaw=0;
+        rateErr_roll  = rollSp  - rollRate;
+        rateErr_pitch = pitchSp - pitchRate;
+        rateErr_yaw   = 0.0f    - yawRate;
 
-        rateI_roll  = clamp_f(rateI_roll  + rateErr_roll  * RATE_DT, -RATE_I_MAX, RATE_I_MAX);
-        rateI_pitch = clamp_f(rateI_pitch + rateErr_pitch * RATE_DT, -RATE_I_MAX, RATE_I_MAX);
-        rateI_yaw   = clamp_f(rateI_yaw   + rateErr_yaw   * RATE_DT, -RATE_I_MAX, RATE_I_MAX);
+        // --- Integrators (only when armed) ---
+        if (motorsArmed&& !rampActive) {
+            rateI_roll  = clamp_f(rateI_roll  + rateErr_roll  * RATE_DT, -RATE_I_MAX, RATE_I_MAX);
+            rateI_pitch = clamp_f(rateI_pitch + rateErr_pitch * RATE_DT, -RATE_I_MAX, RATE_I_MAX);
+            rateI_yaw   = clamp_f(rateI_yaw   + rateErr_yaw   * RATE_DT, -RATE_I_MAX, RATE_I_MAX);
+        }
 
-        float rateD_roll  = -(rollRate  - rollRate_prev)  / RATE_DT;
-        float rateD_pitch = -(pitchRate - pitchRate_prev) / RATE_DT;
-        float rateD_yaw   = -(yawRate   - yawRate_prev)   / RATE_DT;
+        // --- D term on measurement, filtered ---
+        float rateD_roll_raw  = -(rollRate  - rollRate_prev)  / RATE_DT;
+        float rateD_pitch_raw = -(pitchRate - pitchRate_prev) / RATE_DT;
+        float rateD_yaw_raw   = -(yawRate   - yawRate_prev)   / RATE_DT;
+
+        rollD_f  += D_LPF_ALPHA * (rateD_roll_raw  - rollD_f);
+        pitchD_f += D_LPF_ALPHA * (rateD_pitch_raw - pitchD_f);
+        yawD_f   += D_LPF_ALPHA * (rateD_yaw_raw   - yawD_f);
+
         rollRate_prev  = rollRate;
         pitchRate_prev = pitchRate;
         yawRate_prev   = yawRate;
 
-        float rollOut  = clamp_f(RATE_KP_ROLL  * rateErr_roll  + RATE_KI_ROLL  * rateI_roll  + RATE_KD_ROLL  * rateD_roll,  -ROLL_OUT_MAX,  ROLL_OUT_MAX);
-        float pitchOut = clamp_f(RATE_KP_PITCH * rateErr_pitch + RATE_KI_PITCH * rateI_pitch + RATE_KD_PITCH * rateD_pitch, -PITCH_OUT_MAX, PITCH_OUT_MAX);
-        float yawOut   = clamp_f(RATE_KP_YAW   * rateErr_yaw   + RATE_KI_YAW   * rateI_yaw   + RATE_KD_YAW   * rateD_yaw,  -YAW_OUT_MAX,   YAW_OUT_MAX);
+        // --- PID outputs ---
+        static float rollOut=0, pitchOut=0, yawOut=0;
+        rollOut  = clamp_f(RATE_KP_ROLL  * rateErr_roll  + RATE_KI_ROLL  * rateI_roll  + RATE_KD_ROLL  * rollD_f,  -ROLL_OUT_MAX,  ROLL_OUT_MAX);
+        pitchOut = clamp_f(RATE_KP_PITCH * rateErr_pitch + RATE_KI_PITCH * rateI_pitch + RATE_KD_PITCH * pitchD_f, -PITCH_OUT_MAX, PITCH_OUT_MAX);
+        yawOut   = clamp_f(RATE_KP_YAW   * rateErr_yaw   + RATE_KI_YAW   * rateI_yaw   + RATE_KD_YAW   * yawD_f,  -YAW_OUT_MAX,   YAW_OUT_MAX);
 
-        float m1 = baseThrust + rollOut  + yawOut;
-        float m2 = baseThrust + pitchOut - yawOut;
-        float m3 = baseThrust - rollOut  + yawOut;
-        float m4 = baseThrust - pitchOut - yawOut;
+        float thrustNow = rampThrust(nowUs);
+
+        float m1 = thrustNow + rollOut  + yawOut;
+        float m2 = thrustNow + pitchOut - yawOut;
+        float m3 = thrustNow - rollOut  + yawOut;
+        float m4 = thrustNow - pitchOut - yawOut;
 
         m1_us = constrain((int)(m1*1000+1000), 1000, 2000);
         m2_us = constrain((int)(m2*1000+1000), 1000, 2000);
         m3_us = constrain((int)(m3*1000+1000), 1000, 2000);
         m4_us = constrain((int)(m4*1000+1000), 1000, 2000);
 
-        if (!motorsArmed) motorsSetAll(1000);
-        else {
-            tLib.motors.set(1,m1_us); tLib.motors.set(2,m2_us);
-            tLib.motors.set(3,m3_us); tLib.motors.set(4,m4_us);
+        if (!motorsArmed) {
+            motorsSetAll(1000);
+        } else {
+            tLib.motors.set(1, m1_us);
+            tLib.motors.set(2, m2_us);
+            tLib.motors.set(3, m3_us);
+            tLib.motors.set(4, m4_us);
         }
     }
 
