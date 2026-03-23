@@ -444,6 +444,21 @@ void loop() {
         velSpX = clamp_f(POS_KP * xErr, -MAX_VEL, MAX_VEL);
         velSpY = clamp_f(POS_KP * yErr, -MAX_VEL, MAX_VEL);
     }
+    float gpsHeading_deg = atan2f(velX, velY) * 57.2957795f;
+    float speed = sqrtf(velX*velX + velY*velY);
+    if (speed > 1.0f) {
+
+    float yawError = gpsHeading_deg - yawEst;
+
+    // wrap to [-180, 180]
+    if (yawError > 180) yawError -= 360;
+    if (yawError < -180) yawError += 360;
+
+    // slow correction (VERY IMPORTANT: small gain)
+    const float YAW_CORR_K = 0.02f;
+
+    yawEst += YAW_CORR_K * yawError;
+    }
 
     // Angle loop
     if ((int32_t)(nowUs - lastAngleUs) >= (int32_t)ANGLE_PERIOD_US) {
