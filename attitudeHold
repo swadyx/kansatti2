@@ -25,26 +25,26 @@ static constexpr float    ANGLE_FUSE_ALPHA    = 0.985f;
 static constexpr float ANGLE_I_MAX        = 10;
 static constexpr float MAX_ANGLE_RATE_DPS = 400.0f;
 
-static float RATE_KP_ROLL       = 0.00065f;
-static float RATE_KP_PITCH      = 0.00065f;
-static float RATE_KP_YAW        = 0.001f;   // recommended (not 0)
+static float RATE_KP_ROLL       = 0.001f;
+static float RATE_KP_PITCH      = 0.001f;
+static float RATE_KP_YAW        = 0.015f; 
 
 static float RATE_KI_ROLL       = 0.003f; //0,003
 static float RATE_KI_PITCH      = 0.003f; //0,003
-static float RATE_KI_YAW        = 0.001f;
+static float RATE_KI_YAW        = 0.003f;
 
 static float RATE_KD_ROLL       = 0.000004f;
 static float RATE_KD_PITCH      = 0.000004f;
-static float RATE_KD_YAW        = 0.0f;
+static float RATE_KD_YAW        = 0.000002f;
 
 static float ANGLE_KP_ROLL      = 1.5f;
 static float ANGLE_KP_PITCH     = 1.5f;
-static float ANGLE_KI_ROLL      = 1.0f; // 2
-static float ANGLE_KI_PITCH     = 1S.0f; //2
+static float ANGLE_KI_ROLL      = 2.0f; // 2
+static float ANGLE_KI_PITCH     = 2.0f; //2
 
 static constexpr float RATE_I_MAX = 30.0f;
 
-static constexpr float GYRO_LPF_ALPHA = 0.4f;
+static constexpr float GYRO_LPF_ALPHA = 0.5f;
 
 static float rollD_f  = 0.0f;
 static float pitchD_f = 0.0f;
@@ -149,7 +149,7 @@ static void sensorStep(uint32_t nowUs) {
     const float biasAlpha = 0.03f;
     gyroBiasX += biasAlpha * ((double)gx - gyroBiasX);
     gyroBiasY += biasAlpha * ((double)gy - gyroBiasY);
-    gyroBiasZ += biasAlpha * ((double)gz - gyroBiasZ);
+    // gyroBiasZ += biasAlpha * ((double)gz - gyroBiasZ);
   }
 
   gx_dps = gx - (float)gyroBiasX;
@@ -184,8 +184,6 @@ static void resetPIDState() {
     rateI_roll = rateI_pitch = rateI_yaw = 0.0f;
     rollSp = pitchSp = 0.0f;
     rollRate_prev = pitchRate_prev = yawRate_prev = 0.0f;
-    altHoldI     = 0.0f;
-    altThrustAdj = 0.0f;
 }
 
 static void sendPIDConfig() {
@@ -223,7 +221,7 @@ static void applyPIDCommand(const PIDCommand &pc) {
 }
 
 // ===================== RAMP STATE =====================
-static constexpr float RAMP_DURATION_S  = 1.0f;
+static constexpr float RAMP_DURATION_S  = 0.5f;
 static constexpr float RAMP_START_NORM  = 0;   // 1200 µs = (1200-1000)/1000
 static bool     rampActive  = false;
 static uint32_t rampStartUs = 0;
@@ -269,7 +267,7 @@ static void applyCommand(uint8_t cmd) {
             rampStartUs    = micros();
             rollRate_prev  = pitchRate_prev = yawRate_prev = 0.0f;
             resetPIDState();
-            altHoldInit();           // <-- add this
+            // altHoldInit();           // <-- add this
             Serial.println("[FC] ARMED — ramping");
             break;
     break;
@@ -344,7 +342,6 @@ void loop() {
 
     tLib.update();
     sensorStep(nowUs);
-    altHoldStep(nowMs);
 
     // Single dispatcher — handles Command and PIDCommand frofam the same stream
     {
