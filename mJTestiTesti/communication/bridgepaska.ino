@@ -172,7 +172,7 @@ void loop() {
   }
 
   if (continuousCapture && (millis() - lastCaptureTime >= captureInterval)) {
-    Serial.println("capturing photo...")
+    Serial.println("capturing photo...");
     takePhoto();
     lastCaptureTime = millis();
   }
