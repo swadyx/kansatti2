@@ -57,8 +57,9 @@ bool initCamera() {
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
+  // FRAMESIZE_QQVGA, HQVGA, QVGA, CIF, VGA, SVGA, XGA, SXGA, UXGA, FHD, QHD, WQXGA etc. tässä vaihtoehdot millasta kuvaa (eri kokosia) ottaa kato netistä koot en tiiä
   config.frame_size = FRAMESIZE_UXGA;
-  config.jpeg_quality = 10;
+  config.jpeg_quality = 10; // 0-63 pienempi = parempi
   config.fb_count = 1;
   config.grab_mode = CAMERA_GRAB_LATEST;
   if (esp_camera_init(&config) != ESP_OK) {
