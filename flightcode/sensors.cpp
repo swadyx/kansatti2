@@ -2,7 +2,7 @@
 #include <Tonttulib.h>
 #include <math.h>
 
-static Tonttulib tLib;
+extern Tonttulib tLib;
 
 // ===== STATE =====
 static float rollEst=0, pitchEst=0, yawEst=0;
@@ -12,9 +12,11 @@ static double gyroBiasX=0, gyroBiasY=0, gyroBiasZ=0;
 
 static uint32_t lastImuUs = 0;
 static constexpr uint32_t IMU_PERIOD_US = 2000;
+static constexpr uint32_t BARO_PERIOD_US = 20000;
 
 static bool angleInit = false;
 float ax, ay, az, gx, gy, gz;
+float pressure = 0.0f;
 
 static double lastLat = 0;
 static double lastLon = 0;
@@ -24,19 +26,39 @@ static uint32_t lastVelUpdateUs = 0;
 static float velX_filt = 0;
 static float velY_filt = 0;
 
+float groundPressure;
+
 static constexpr float ALPHA = 0.2f;
 static constexpr float MAX_VEL = 10.0f;
 static inline float clamp(float x, float lo, float hi) {
     return x < lo ? lo : (x > hi ? hi : x);
 }
 
+void updatePressure50Hz() {
+    static uint32_t lastUpdateUs = 0;
+
+    uint32_t now = micros();
+    if (now - lastUpdateUs >= BARO_PERIOD_US) {
+        lastUpdateUs = now;
+
+        float newPressure = tLib.baro.readPressure();
+
+        // NaN guard
+        if (!isnan(newPressure)) {
+            pressure = newPressure;
+        }
+    }
+}
+
 // ===== INIT =====
 void Sensors::init() {
-    tLib.init();
+    groundPressure = setGroundPressure();
 }
 
 // ===== UPDATE =====
 void Sensors::update(uint32_t nowUs) {
+
+    updatePressure50Hz();
 
     if ((int32_t)(nowUs - lastImuUs) < IMU_PERIOD_US) return;
     lastImuUs = nowUs;
@@ -110,11 +132,30 @@ float Sensors::getAccX() { return ax; }
 float Sensors::getAccY() { return ay; }
 float Sensors::getAccZ() { return az; }
 
-bool Sensors::gpsHasFix() { return tLib.gps.hasFix(); }
+float Sensors::setGroundPressure() {
+    const int NUM_SAMPLES = 30;
+    float sum = 0.0f;
+    int count = 0;
+    while (count < NUM_SAMPLES) {
+        float p = tLib.baro.readPressure();
+        if (p > 0.0f && !isnan(p)) {
+            sum += p;
+            count++;
+        }
+        delay(20);  // matches BARO_PERIOD_US (50Hz)
+    }
+    return sum / NUM_SAMPLES;
+}
+float Sensors::getGroundPressure() {return groundPressure; }
+float Sensors::getPressure() { return pressure; }
+
+bool Sensors::gpsHasFix() { return (tLib.gps.fixType() == 1 ? true : false); }
 bool Sensors::gpsHasNew() { return tLib.gps.hasNewData(); }
 
-double Sensors::getLat() { return tLib.gps.latitude; }
-double Sensors::getLon() { return tLib.gps.longitude; }
+float Sensors::getLDR() { return tLib.ldr.readVoltage(); }
+
+double Sensors::getLat() { return tLib.gps.latitude(); }
+double Sensors::getLon() { return tLib.gps.longitude(); }
 
 float Sensors::velX() { return velX_filt; }
 float Sensors::velY() { return velY_filt; }
