@@ -1,7 +1,7 @@
 #pragma once
 #include <Arduino.h>
 
-namespace Motors {
+namespace Motor {
 
 void init();
 void setAll(uint16_t us);
