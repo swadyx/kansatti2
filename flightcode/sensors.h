@@ -11,6 +11,10 @@ float getRoll();
 float getPitch();
 float getYaw();
 
+float getGroundPressure();
+float getPressure();
+float setGroundPressure();
+
 float getGyroX();
 float getGyroY();
 float getGyroZ();
@@ -21,6 +25,8 @@ float getAccZ();
 
 bool gpsHasFix();
 bool gpsHasNew();
+
+float getLDR();
 
 double getLat();
 double getLon();
