@@ -1,4 +1,4 @@
-#include "fc_comms.h"
+#include "comms.h"
 #include <Tonttulib.h>
 
 namespace FcComms {
@@ -239,7 +239,7 @@ static bool handleCommand(Tonttulib& tLib, const Proto::Packet& pkt) {
   }
 }
 
-void update(Tonttulib& tLib) {
+void update(::Tonttulib& tLib) {
   if (!sSerial) return;
 
   Proto::Packet pkt{};
