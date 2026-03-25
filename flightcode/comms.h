@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 #include "protocol.h"
+#include <Tonttulib.h>
 
 namespace FcComms {
 
@@ -50,7 +51,7 @@ struct Callbacks {
 void begin(HardwareSerial& serial, uint32_t baud, const Callbacks& callbacks = {});
 
 // Incoming commands + periodic internal comms housekeeping
-void update(class Tonttulib& tLib);
+void update(::Tonttulib& tLib);
 
 // Outgoing packets: caller passes prepared data
 void sendStatus(const StatusData& data);
