@@ -207,13 +207,6 @@ struct ImuRawPayload {
 };
 #pragma pack(pop)
 
-FlightState getFlightState(const Proto::Packet& pkt) {
-    Proto::StatusPayload sp;
-    if (Proto::payloadAs(pkt, sp)) {
-        return (Proto::FlightState)sp.state;
-    }
-    return Proto::STATE_FAULT; // fallback
-}
 
 
 struct Parser {
@@ -404,5 +397,13 @@ static inline const char *eventName(uint8_t e) {
         case EVT_PHOTO_TAKEN: return "PHOTO_TAKEN"; default: return "EVENT_UNKNOWN";
     }
 }
+inline FlightState getFlightState(const Proto::Packet& pkt) {
+    Proto::StatusPayload sp;
+    if (Proto::payloadAs(pkt, sp)) {
+        return (Proto::FlightState)sp.state;
+    }
+    return Proto::STATE_FAULT; // fallback
+}
+
 
 } // namespace Proto
