@@ -1,5 +1,8 @@
 #pragma once
 #include <Arduino.h>
+#include <Tonttulib.h>
+
+extern Tonttulib tLib; 
 
 namespace FC {
 
