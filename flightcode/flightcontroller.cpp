@@ -1,276 +1,416 @@
-#include "protocol.h"
-#include "sensors.h"
 #include "flightcontroller.h"
-#include "comms.h"
+#include "sensors.h"
+#include "motor.h"
+#include <math.h>
 #include <Tonttulib.h>
-#include <Wire.h>
-#include "transfers.h"
-#include "datalogger.h"
 
-Tonttulib tLib;
+// ===================== USER SETTINGS =====================
+static constexpr float THRUST_MIN = 0.00f;
+static constexpr float THRUST_MAX = 0.90f;
 
-static constexpr uint32_t BRIDGE_BAUD = 921600;
-static HardwareSerial& BRIDGE_SERIAL = Serial1;
+// Hold motors at 1000 us for 8 s after powered flight begins
+static constexpr uint32_t POWERED_FLIGHT_DELAY_US = 8000000UL;
 
-static uint8_t currentState = Proto::STATE_IDLE;
-static uint16_t statusFlags = 0;
-static uint32_t lastStatusUs = 0;
-static uint32_t lastPrimaryMissionUs = 0;
-static uint32_t lastAttitudeUs = 0;
-static uint16_t txSeq = 1;
+static float baseThrust  = 0.50f;
+static bool  motorsArmed = false;
 
-static uint8_t bootRecoveredState = Proto::STATE_IDLE;
-static bool referenceDataStored = false;
+// powered-flight gating
+static bool poweredFlightStarted = false;
+static uint32_t poweredFlightStartUs = 0;
 
-static uint16_t nextSeq() {
-    return txSeq++;
+// ===================== CONTROL SETTINGS =====================
+static constexpr uint32_t RATE_PERIOD_US      = 2000;
+static constexpr uint32_t ANGLE_PERIOD_US     = 2000;
+static constexpr float    RATE_DT             = RATE_PERIOD_US  * 1e-6f;
+static constexpr float    ANGLE_DT            = ANGLE_PERIOD_US * 1e-6f;
+
+static constexpr float ANGLE_I_MAX        = 10.0f;
+static constexpr float MAX_ANGLE_RATE_DPS = 400.0f;
+
+static float RATE_KP_ROLL       = 0.001f;
+static float RATE_KP_PITCH      = 0.001f;
+static float RATE_KP_YAW        = 0.015f; 
+
+static float RATE_KI_ROLL       = 0.003f;
+static float RATE_KI_PITCH      = 0.003f;
+static float RATE_KI_YAW        = 0.003f;
+
+static float RATE_KD_ROLL       = 0.000004f;
+static float RATE_KD_PITCH      = 0.000004f;
+static float RATE_KD_YAW        = 0.000002f;
+
+static float ANGLE_KP_ROLL      = 1.5f;
+static float ANGLE_KP_PITCH     = 1.5f;
+static float ANGLE_KI_ROLL      = 2.0f;
+static float ANGLE_KI_PITCH     = 2.0f;
+
+static constexpr float RATE_I_MAX = 30.0f;
+static constexpr float GYRO_LPF_ALPHA = 0.5f;
+static constexpr float D_LPF_ALPHA = 0.09f;
+
+static constexpr float ROLL_OUT_MAX   = 0.3f;
+static constexpr float PITCH_OUT_MAX  = 0.3f;
+static constexpr float YAW_OUT_MAX    = 0.12f;
+
+static constexpr float ROLL_RATE_SIGN  = +1.0f;
+static constexpr float PITCH_RATE_SIGN = +1.0f;
+static constexpr float YAW_RATE_SIGN   = +1.0f;
+
+// ===================== TARGET =====================
+bool FC::hasTarget = false;
+float targetLon = 0.0f;
+float targetLat = 0.0f;
+
+// ===================== PID state =====================
+static float angleI_roll=0, angleI_pitch=0;
+static float rateI_roll=0, rateI_pitch=0, rateI_yaw=0;
+static float rollSp=0, pitchSp=0;
+static float rollRate_prev=0, pitchRate_prev=0, yawRate_prev=0;
+
+static float rollD_f  = 0.0f;
+static float pitchD_f = 0.0f;
+static float yawD_f   = 0.0f;
+
+static float gx_f=0, gy_f=0, gz_f=0;
+
+// ===================== GPS MOVEMENT =====================
+static double measuredPosX=0, measuredPosY=0;
+static double lastPosX=0, lastPosY=0;
+static double velX=0, velY=0;
+static uint32_t lastGpsTime=0;
+
+static float velEstX=0, velEstY=0;
+static float targetPositionX = 0.0f;
+static float targetPositionY = 0.0f;
+
+static constexpr float POS_KP = 0.4f;
+static constexpr float MAX_VEL = 5.0f;
+static constexpr float VEL_KP = 4.0f;
+static constexpr float VEL_DAMP_K = 1.5f;
+static constexpr float MAX_ANGLE_GPS = 15.0f;
+
+// ===================== RAMP STATE =====================
+static constexpr float RAMP_DURATION_S  = 0.5f;
+static constexpr float RAMP_START_NORM  = 0.0f;
+static bool     rampActive  = false;
+static uint32_t rampStartUs = 0;
+
+// ===================== HELPERS =====================
+static inline float clamp_f(float x, float lo, float hi) {
+    return x < lo ? lo : (x > hi ? hi : x);
 }
 
-static uint16_t readLipoMv() {
-    const float v = tLib.vlipo.readVoltage();
-    if (v <= 0.0f) return 0;
-    float mv = v * 1000.0f;
-    if (mv < 0.0f) mv = 0.0f;
-    if (mv > 65535.0f) mv = 65535.0f;
-    return (uint16_t)(mv + 0.5f);
+static uint16_t m1_us=1000, m2_us=1000, m3_us=1000, m4_us=1000;
+
+static void motorsSetAll(uint16_t us) {
+    tLib.motors.set(1, us);
+    tLib.motors.set(2, us);
+    tLib.motors.set(3, us);
+    tLib.motors.set(4, us);
 }
 
-static int32_t roundToInt32(float x) {
-    return (int32_t)(x + (x >= 0.0f ? 0.5f : -0.5f));
-}
+static inline float rampThrust(uint32_t nowUs) {
+    if (!rampActive) return baseThrust;
 
-void sendGps() {
-    if (!Sensors::gpsHasNew()) return;
-
-    Proto::GpsPayload g{};
-    g.lat_e7 = (int32_t)(Sensors::getLat() * 10000000.0);
-    g.lon_e7 = (int32_t)(Sensors::getLon() * 10000000.0);
-    g.alt_cm = 0;
-    g.sats = 0;
-    g.fix_type = tLib.gps.fixType();
-
-    float vx = Sensors::velX();
-    float vy = Sensors::velY();
-    float speed = sqrtf(vx * vx + vy * vy);
-    g.ground_speed_cms = (int32_t)(speed * 100.0f);
-
-    Proto::sendTyped(BRIDGE_SERIAL, Proto::MSG_GPS, 0, nextSeq(), g);
-}
-
-static void sendPrimaryMissionData() {
-    Proto::PrimaryMissionPayload p{};
-    p.pressure_pa    = roundToInt32(Sensors::getPressure());
-    p.temperature_cC = roundToInt32(Sensors::getTemp() * 100.0f);
-
-    Proto::sendTyped(
-        BRIDGE_SERIAL,
-        Proto::MSG_PRIMARY_MISSION,
-        0,
-        nextSeq(),
-        p
-    );
-}
-
-static void sendPrimaryMissionDataIfDue(uint32_t nowUs, uint32_t periodUs = 200000U) {
-    if ((uint32_t)(nowUs - lastPrimaryMissionUs) < periodUs) return;
-    lastPrimaryMissionUs = nowUs;
-    sendPrimaryMissionData();
-}
-
-static void setState(uint8_t newState) {
-    if (currentState == newState) return;
-    currentState = newState;
-    tLib.eeprom.writeFlightState(newState);
-}
-
-static void onSetStateCommand(uint8_t newState) {
-    setState(newState);
-}
-
-static FcComms::StatusData makeStatusData() {
-    FcComms::StatusData s{};
-    s.state = currentState;
-    s.armed = FC::isArmed();
-    s.gpsFix = Sensors::gpsHasFix();
-    s.lipoMv = readLipoMv();
-
-    uint16_t flags = statusFlags;
-
-    if (s.gpsFix) flags |= Proto::STATUSF_GPS_FIX;
-    else          flags &= (uint16_t)~Proto::STATUSF_GPS_FIX;
-
-    if (FC::hasTarget) flags |= Proto::STATUSF_HAS_TARGET;
-    else               flags &= (uint16_t)~Proto::STATUSF_HAS_TARGET;
-
-    s.flags = flags;
-
-    return s;
-}
-
-static void tryStoreReferenceData() {
-    if (referenceDataStored) return;
-    if (!FC::hasTarget) return;
-
-    const int32_t lat0_e7 = (int32_t)(FC::getTargetLat() * 10000000.0f);
-    const int32_t lon0_e7 = (int32_t)(FC::getTargetLon() * 10000000.0f);
-    const int32_t p0_pa   = (int32_t)(Sensors::getPressure() + (Sensors::getPressure() >= 0.0f ? 0.5f : -0.5f));
-
-    tLib.eeprom.writeReferenceData(lat0_e7, lon0_e7, p0_pa);
-    referenceDataStored = true;
-}
-
-static void restoreDataFromEeprom() {
-    int32_t lat0_e7 = 0;
-    int32_t lon0_e7 = 0;
-    int32_t p0_pa = 0;
-
-    tLib.eeprom.readReferenceData(lat0_e7, lon0_e7, p0_pa);
-
-    const float lat0 = lat0_e7 / 10000000.0f;
-    const float lon0 = lon0_e7 / 10000000.0f;
-    const float p0   = (float)p0_pa;
-
-    FC::setStoredTarget(lat0, lon0);
-
-    Sensors::setGroundPressureTo((float)p0);
-
-    referenceDataStored = true;
-}
-
-void setup() {
-    Serial.begin(115200);
-    Wire.begin();
-
-    const int status = tLib.init();
-    if (status != 1) {
-        statusFlags |= Proto::STATUSF_INIT_FAILED;
+    float elapsed = (nowUs - rampStartUs) * 1e-6f;
+    if (elapsed >= RAMP_DURATION_S) {
+        rampActive = false;
+        return baseThrust;
     }
 
-    FcComms::Callbacks cb{};
-    cb.onSetState = onSetStateCommand;
-    FcComms::begin(BRIDGE_SERIAL, BRIDGE_BAUD, cb);
-
-    if (status != 1) {
-        FcComms::sendInitError(status);
-        while (true) {
-            delay(1000);
-        }
-    }
-
-    bootRecoveredState = tLib.eeprom.readFlightState();
-
-    const bool recoveredInFlight =
-        (bootRecoveredState == Proto::STATE_ROCKET) ||
-        (bootRecoveredState == Proto::STATE_FREEFLIGHT) ||
-        (bootRecoveredState == Proto::STATE_POWERED_FLIGHT);
-
-    const bool flashHasData = DataLogger::flashContainsData();
-
-    if (recoveredInFlight) {
-        restoreDataFromEeprom();
-        currentState = bootRecoveredState;
-
-        if (!DataLogger::beginRecoveredOnly(true)) {
-            statusFlags |= Proto::STATUSF_INIT_FAILED;
-            currentState = Proto::STATE_FAULT;
-            FcComms::sendError(10, (int32_t)DataLogger::getError());
-        } else {
-            FcComms::sendEvent(Proto::EVT_BOOT, (int32_t)bootRecoveredState);
-        }
-    } else if (flashHasData) {
-        statusFlags |= Proto::STATUSF_INIT_FAILED;
-        currentState = Proto::STATE_FAULT;
-        FcComms::sendError(11, (int32_t)bootRecoveredState);
-        
-    } else {
-        currentState = bootRecoveredState;
-    }
-
-    tLib.led.blinkFast();
-
-    FcComms::sendBootEvent();
-    FcComms::sendFcBootInfo();
-    Sensors::init();
+    float t = elapsed / RAMP_DURATION_S;
+    return RAMP_START_NORM + t * (baseThrust - RAMP_START_NORM);
 }
 
-void loop() {
-    uint32_t nowUs = micros();
+static void resetControllers() {
+    angleI_roll = 0.0f;
+    angleI_pitch = 0.0f;
+    rateI_roll = 0.0f;
+    rateI_pitch = 0.0f;
+    rateI_yaw = 0.0f;
 
-    Sensors::update(nowUs, currentState);
+    rollSp = 0.0f;
+    pitchSp = 0.0f;
+
+    rollRate_prev = 0.0f;
+    pitchRate_prev = 0.0f;
+    yawRate_prev = 0.0f;
+
+    rollD_f = 0.0f;
+    pitchD_f = 0.0f;
+    yawD_f = 0.0f;
+
+    velEstX = 0.0f;
+    velEstY = 0.0f;
+}
+
+// ===================== VERTICAL VELOCITY PID =====================
+static constexpr float VZ_KP = 0.08f;
+static constexpr float VZ_KI = 0.02f;
+static constexpr float VZ_KD = 0.01f;
+static constexpr float VZ_TARGET = -5.0f;  // m/s, negative = descending
+static constexpr float VZ_I_MAX  = 0.15f;
+
+static float vzI = 0.0f;
+static float vzPrev = 0.0f;
+
+static float computeVerticalThrust(float vz, float dt) {
+    float err = VZ_TARGET - vz;
+
+    vzI = clamp_f(vzI + err * dt, -VZ_I_MAX, VZ_I_MAX);
+
+    float d = -(vz - vzPrev) / dt;
+    vzPrev = vz;
+
+    float out = baseThrust + VZ_KP * err + VZ_KI * vzI + VZ_KD * d;
+    return clamp_f(out, THRUST_MIN, THRUST_MAX);
+}
+// ===================== BARO VELOCITY =====================
+static float vz_filt = 0.0f;
+static float lastAltM = 0.0f;
+static uint32_t lastBaroUs = 0;
+
+static constexpr float VZ_LPF_ALPHA = 0.2f;
+
+// Convert pressure to altitude (meters)
+static float pressureToAlt(float hPa) {
+    return 44330.0f * (1.0f - powf(hPa / Sensors::getGroundPressure(), 0.1903f));
+}
+
+static void updateVz(uint32_t nowUs) {
+    float alt = pressureToAlt(Sensors::getPressure());
+    if (lastBaroUs == 0) {
+        lastAltM   = alt;
+        lastBaroUs = nowUs;
+        return;
+    }
+    float dt = (nowUs - lastBaroUs) * 1e-6f;
+    lastBaroUs = nowUs;
+
+    float vz_raw = (alt - lastAltM) / dt;
+    lastAltM = alt;
+
+    vz_filt += VZ_LPF_ALPHA * (vz_raw - vz_filt);
+}
+
+// ===================== API =====================
+void FC::init() {
+    motorsArmed = false;
+    poweredFlightStarted = false;
+    poweredFlightStartUs = 0;
+    rampActive = false;
+    rampStartUs = 0;
+
+    resetControllers();
+    motorsSetAll(1000);
+}
+
+void FC::arm() {
+    motorsArmed = true;
+    motorsSetAll(1000);
+}
+
+void FC::disarm() {
+    motorsArmed = false;
+    poweredFlightStarted = false;
+    poweredFlightStartUs = 0;
+    rampActive = false;
+    rampStartUs = 0;
+
+    resetControllers();
+    motorsSetAll(1000);
+}
+
+bool FC::isArmed() {
+    return motorsArmed;
+}
+
+void FC::beginPoweredFlight(uint32_t nowUs) {
+    if (poweredFlightStarted) return;
+
+    poweredFlightStarted = true;
+    poweredFlightStartUs = nowUs;
+
+    resetControllers();
+    motorsSetAll(1000);
+}
+
+bool FC::thrustEnabled(uint32_t nowUs) {
+    if (!motorsArmed) return false;
+    if (!poweredFlightStarted) return false;
+    return (uint32_t)(nowUs - poweredFlightStartUs) >= POWERED_FLIGHT_DELAY_US;
+}
+
+void FC::setTarget() {
+    if (!hasTarget && Sensors::gpsHasFix()) {
+        targetLat = Sensors::getLat();
+        targetLon = Sensors::getLon();
+        hasTarget = true;
+    }
+}
+
+void FC::setStoredTarget(float lat, float lon) {
+    targetLat = lat;
+    targetLon = lon;
+    hasTarget = true;
+}
+
+float FC::getTargetLat() { return targetLat; }
+float FC::getTargetLon() { return targetLon; }
+
+// ===================== MAIN UPDATE =====================
+void FC::update(uint32_t nowUs) {
+    static float velSpX = 0.0f;
+    static float velSpY = 0.0f;
+
+    static uint32_t lastRateUs  = 0;
+    static uint32_t lastAngleUs = 0;
+
+    if (!lastRateUs)  lastRateUs  = nowUs;
+    if (!lastAngleUs) lastAngleUs = nowUs;
+
+    updateVz(nowUs);
+
     if (Sensors::gpsHasNew()) {
-        Sensors::updateVelocity(nowUs);
+        double lat = Sensors::getLat();
+        double lon = Sensors::getLon();
+
+        measuredPosX = (lon - targetLon) * cos(targetLat * DEG_TO_RAD) * 111320.0;
+        measuredPosY = (lat - targetLat) * 111320.0;
+
+        uint32_t nowGps = millis();
+        float dtGps = (nowGps - lastGpsTime) * 0.001f;
+        lastGpsTime = nowGps;
+
+        if (dtGps > 0.001f) {
+            velX = (measuredPosX - lastPosX) / dtGps;
+            velY = (measuredPosY - lastPosY) / dtGps;
+            lastPosX = measuredPosX;
+            lastPosY = measuredPosY;
+        }
+
+        float xErr = targetPositionX - measuredPosX;
+        float yErr = targetPositionY - measuredPosY;
+
+        velSpX = clamp_f(POS_KP * xErr, -MAX_VEL, MAX_VEL);
+        velSpY = clamp_f(POS_KP * yErr, -MAX_VEL, MAX_VEL);
     }
 
-    switch (currentState) {
-        case Proto::STATE_IDLE:
-            FC::disarm();
-            break;
+    const bool enabled = FC::thrustEnabled(nowUs);
 
-        case Proto::STATE_PRELAUNCH:
-            FC::setTarget();
-            FC::arm();
-            tryStoreReferenceData();
-            if (Transfers::launchDetected(Sensors::getAccX(), Sensors::getAccY(), Sensors::getAccZ())) {
-                setState(Proto::STATE_ROCKET);
-            }
-            break;
+    if ((int32_t)(nowUs - lastAngleUs) >= (int32_t)ANGLE_PERIOD_US) {
+        lastAngleUs += ANGLE_PERIOD_US;
 
-        case Proto::STATE_ROCKET:
-            FC::arm();
-            DataLogger::update(millis(), currentState);
-            if (Transfers::deploymentDetected(Sensors::getLDR())) {
-                setState(Proto::STATE_FREEFLIGHT);
-            }
-            sendPrimaryMissionDataIfDue(nowUs);
-            sendGps();
-            break;
+        float rollAngleSp_deg =
+            clamp_f(
+                VEL_KP * (velSpY - velY) - VEL_DAMP_K * velEstY,
+                -MAX_ANGLE_GPS,
+                MAX_ANGLE_GPS
+            );
 
-        case Proto::STATE_FREEFLIGHT:
-            FC::arm();
-            DataLogger::update(millis(), currentState);
-            if (Transfers::stableDetected()) {
-                FC::beginPoweredFlight(nowUs);
-                setState(Proto::STATE_POWERED_FLIGHT);
-            }
-            sendPrimaryMissionDataIfDue(nowUs);
-            sendGps();
-            break;
+        float pitchAngleSp_deg =
+            clamp_f(
+                VEL_KP * (velSpX - velX) - VEL_DAMP_K * velEstX,
+                -MAX_ANGLE_GPS,
+                MAX_ANGLE_GPS
+            );
 
-        case Proto::STATE_POWERED_FLIGHT:
-            FC::arm();
-            FC::update(nowUs);
-            DataLogger::update(millis(), currentState);
-            if ((uint32_t)(nowUs - lastAttitudeUs) >= 200000U) {
-                lastAttitudeUs = nowUs;
-                Proto::AttitudePayload a{};
-                a.roll_cdeg  = (int16_t)(Sensors::getRoll() * 100.0f);
-                a.pitch_cdeg = (int16_t)(Sensors::getPitch() * 100.0f);
-                a.yaw_cdeg   = (int16_t)(Sensors::getYaw() * 100.0f);
-                Proto::sendTyped(BRIDGE_SERIAL, Proto::MSG_ATTITUDE, 0, nextSeq(), a);
-            }
+        float angleErr_roll  = rollAngleSp_deg  - Sensors::getRoll();
+        float angleErr_pitch = pitchAngleSp_deg - Sensors::getPitch();
 
-            sendPrimaryMissionDataIfDue(nowUs);
-            sendGps();
+        if (enabled && !rampActive) {
+            angleI_roll  = clamp_f(angleI_roll  + angleErr_roll  * ANGLE_DT, -ANGLE_I_MAX, ANGLE_I_MAX);
+            angleI_pitch = clamp_f(angleI_pitch + angleErr_pitch * ANGLE_DT, -ANGLE_I_MAX, ANGLE_I_MAX);
+        }
 
-            if (Transfers::landingDetected(Sensors::getGroundPressure(), Sensors::getPressure())) {
-                setState(Proto::STATE_GROUND);
-            }
-            break;
-
-        case Proto::STATE_GROUND:
-            sendGps();
-            break;
-
-        default:
-            FC::disarm();
-            break;
+        rollSp  = clamp_f(ANGLE_KP_ROLL  * angleErr_roll  + ANGLE_KI_ROLL  * angleI_roll,
+                          -MAX_ANGLE_RATE_DPS, MAX_ANGLE_RATE_DPS);
+        pitchSp = clamp_f(ANGLE_KP_PITCH * angleErr_pitch + ANGLE_KI_PITCH * angleI_pitch,
+                          -MAX_ANGLE_RATE_DPS, MAX_ANGLE_RATE_DPS);
     }
 
-    tLib.update();
-    FcComms::update(tLib);
+    if ((int32_t)(nowUs - lastRateUs) >= (int32_t)RATE_PERIOD_US) {
+        lastRateUs += RATE_PERIOD_US;
 
-    if ((uint32_t)(nowUs - lastStatusUs) >= 1000000U) {
-        lastStatusUs = nowUs;
-        FcComms::sendStatus(makeStatusData());
+        gx_f += GYRO_LPF_ALPHA * (Sensors::getGyroX() - gx_f);
+        gy_f += GYRO_LPF_ALPHA * (Sensors::getGyroY() - gy_f);
+        gz_f += GYRO_LPF_ALPHA * (Sensors::getGyroZ() - gz_f);
+
+        float rollRate  = ROLL_RATE_SIGN  * gx_f;
+        float pitchRate = PITCH_RATE_SIGN * gy_f;
+        float yawRate   = YAW_RATE_SIGN   * gz_f;
+
+        float accX_world =
+            Sensors::getAccX() * cos(Sensors::getPitch() * DEG_TO_RAD) +
+            Sensors::getAccZ() * sin(Sensors::getPitch() * DEG_TO_RAD);
+
+        float accY_world =
+            Sensors::getAccY() * cos(Sensors::getRoll() * DEG_TO_RAD) +
+            Sensors::getAccZ() * sin(Sensors::getRoll() * DEG_TO_RAD);
+
+        velEstX += accX_world * 9.81f * RATE_DT;
+        velEstY += accY_world * 9.81f * RATE_DT;
+
+        velEstX *= 0.98f;
+        velEstY *= 0.98f;
+
+        float rateErr_roll  = rollSp  - rollRate;
+        float rateErr_pitch = pitchSp - pitchRate;
+        float rateErr_yaw   = 0.0f    - yawRate;
+
+        if (enabled && !rampActive) {
+            rateI_roll  = clamp_f(rateI_roll  + rateErr_roll  * RATE_DT, -RATE_I_MAX, RATE_I_MAX);
+            rateI_pitch = clamp_f(rateI_pitch + rateErr_pitch * RATE_DT, -RATE_I_MAX, RATE_I_MAX);
+            rateI_yaw   = clamp_f(rateI_yaw   + rateErr_yaw   * RATE_DT, -RATE_I_MAX, RATE_I_MAX);
+        }
+
+        float rateD_roll_raw  = -(rollRate  - rollRate_prev)  / RATE_DT;
+        float rateD_pitch_raw = -(pitchRate - pitchRate_prev) / RATE_DT;
+        float rateD_yaw_raw   = -(yawRate   - yawRate_prev)   / RATE_DT;
+
+        rollD_f  += D_LPF_ALPHA * (rateD_roll_raw  - rollD_f);
+        pitchD_f += D_LPF_ALPHA * (rateD_pitch_raw - pitchD_f);
+        yawD_f   += D_LPF_ALPHA * (rateD_yaw_raw   - yawD_f);
+
+        rollRate_prev  = rollRate;
+        pitchRate_prev = pitchRate;
+        yawRate_prev   = yawRate;
+
+        float rollOut  = clamp_f(RATE_KP_ROLL  * rateErr_roll  + RATE_KI_ROLL  * rateI_roll  + RATE_KD_ROLL  * rollD_f,
+                                 -ROLL_OUT_MAX, ROLL_OUT_MAX);
+        float pitchOut = clamp_f(RATE_KP_PITCH * rateErr_pitch + RATE_KI_PITCH * rateI_pitch + RATE_KD_PITCH * pitchD_f,
+                                 -PITCH_OUT_MAX, PITCH_OUT_MAX);
+        float yawOut   = clamp_f(RATE_KP_YAW   * rateErr_yaw   + RATE_KI_YAW   * rateI_yaw   + RATE_KD_YAW   * yawD_f,
+                                 -YAW_OUT_MAX, YAW_OUT_MAX);
+
+        if (!enabled) {
+            motorsSetAll(1000);
+            return;
+        }
+
+        if (!rampActive) {
+            rampActive = true;
+            rampStartUs = nowUs;
+        }
+
+        float thrustNow = rampThrust(nowUs);
+        if(!rampActive) {
+            thrustNow = computeVerticalThrust(vz_filt, RATE_DT);
+        }
+
+        float m1 = thrustNow + rollOut  + yawOut;
+        float m2 = thrustNow + pitchOut - yawOut;
+        float m3 = thrustNow - rollOut  + yawOut;
+        float m4 = thrustNow - pitchOut - yawOut;
+
+        m1_us = constrain((int)(m1 * 1000.0f + 1000.0f), 1000, 2000);
+        m2_us = constrain((int)(m2 * 1000.0f + 1000.0f), 1000, 2000);
+        m3_us = constrain((int)(m3 * 1000.0f + 1000.0f), 1000, 2000);
+        m4_us = constrain((int)(m4 * 1000.0f + 1000.0f), 1000, 2000);
+
+        tLib.motors.set(1, m1_us);
+        tLib.motors.set(2, m2_us);
+        tLib.motors.set(3, m3_us);
+        tLib.motors.set(4, m4_us);
     }
 }
