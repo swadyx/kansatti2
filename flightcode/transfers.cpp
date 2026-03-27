@@ -31,7 +31,7 @@ bool launchDetected(float accX, float accY, float accZ) {
 
 bool deploymentDetected(float ldr) {
     static uint32_t deployEnterUs = 0;
-    const uint32_t DEPLOY_TIMEOUT_US = 15000000UL; // 15s fallback timer
+    const uint32_t DEPLOY_TIMEOUT_US = 14000000UL; // 15s fallback timer
 
     if (deployEnterUs == 0) {
         deployEnterUs = micros(); // start timer on first call
@@ -55,7 +55,7 @@ bool stableDetected() {
 }
 
 bool landingDetected(float p0, float pCurrent) {
-    const float ALT_THRESHOLD = 1.0f; // meters
+    const float ALT_THRESHOLD = 0.5f; // meters
 
     if (p0 <= 0.0f || pCurrent <= 0.0f) return false;
 
