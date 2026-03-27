@@ -104,6 +104,7 @@ enum StatusFlags : uint16_t {
     STATUSF_INIT_FAILED   = 0x0001,
     STATUSF_FLASH_PRESENT = 0x0002,
     STATUSF_GPS_FIX       = 0x0004,
+    STATUSF_HAS_TARGET    = 0x0008,
 };
 
 enum InfoCode : uint8_t {
@@ -205,8 +206,9 @@ struct ImuRawPayload {
   float gy_dps;
   float gz_dps;
 };
-
 #pragma pack(pop)
+
+
 
 struct Parser {
     enum State : uint8_t { WAIT_SYNC1 = 0, WAIT_SYNC2, READ_HEADER, READ_PAYLOAD, READ_CRC };
@@ -396,5 +398,13 @@ static inline const char *eventName(uint8_t e) {
         case EVT_PHOTO_TAKEN: return "PHOTO_TAKEN"; default: return "EVENT_UNKNOWN";
     }
 }
+inline FlightState getFlightState(const Proto::Packet& pkt) {
+    Proto::StatusPayload sp;
+    if (Proto::payloadAs(pkt, sp)) {
+        return (Proto::FlightState)sp.state;
+    }
+    return Proto::STATE_FAULT; // fallback
+}
+
 
 } // namespace Proto
