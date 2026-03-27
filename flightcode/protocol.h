@@ -104,6 +104,7 @@ enum StatusFlags : uint16_t {
     STATUSF_INIT_FAILED   = 0x0001,
     STATUSF_FLASH_PRESENT = 0x0002,
     STATUSF_GPS_FIX       = 0x0004,
+    STATUSF_HAS_TARGET    = 0x0008,
 };
 
 enum InfoCode : uint8_t {
