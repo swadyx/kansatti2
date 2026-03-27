@@ -1,5 +1,6 @@
 #include "comms.h"
 #include <Tonttulib.h>
+#include "sensors.h"
 
 namespace FcComms {
 
@@ -78,41 +79,6 @@ void sendStatus(const StatusData& data) {
   Proto::sendTyped(*sSerial, Proto::MSG_STATUS, 0, nextSeq(), s);
 }
 
-void sendPrimaryMission(const PrimaryMissionData& data) {
-  if (!sSerial) return;
-
-  Proto::PrimaryMissionPayload p{};
-  p.pressure_pa = data.pressurePa;
-  p.temperature_cC = data.temperature_cC;
-
-  Proto::sendTyped(*sSerial, Proto::MSG_PRIMARY_MISSION, 0, nextSeq(), p);
-}
-
-void sendAttitude(const AttitudeData& data) {
-  if (!sSerial) return;
-
-  Proto::AttitudePayload a{};
-  a.roll_cdeg = data.roll_cdeg;
-  a.pitch_cdeg = data.pitch_cdeg;
-  a.yaw_cdeg = data.yaw_cdeg;
-
-  Proto::sendTyped(*sSerial, Proto::MSG_ATTITUDE, 0, nextSeq(), a);
-}
-
-void sendGps(const GpsData& data) {
-  if (!sSerial) return;
-
-  Proto::GpsPayload g{};
-  g.lat_e7 = data.lat_e7;
-  g.lon_e7 = data.lon_e7;
-  g.alt_cm = data.alt_cm;
-  g.sats = data.sats;
-  g.fix_type = data.fixType;
-  g.ground_speed_cms = data.groundSpeed_cms;
-
-  Proto::sendTyped(*sSerial, Proto::MSG_GPS, 0, nextSeq(), g);
-}
-
 void sendImuRaw(const ImuRawData& data) {
   if (!sSerial) return;
 
@@ -140,7 +106,7 @@ void sendInitError(int32_t errorCode) {
 }
 
 static void sendOneShotBaro(Tonttulib& tLib) {
-  const float pressure = tLib.baro.readPressure();
+  const float pressure = Sensors::getPressure();
   sendInfo(Proto::INFO_TEST_BARO,
            (int32_t)(pressure + (pressure >= 0 ? 0.5f : -0.5f)));
 }
@@ -165,7 +131,7 @@ static void sendOneShotGps(Tonttulib& tLib) {
   g.sats = 0;
   g.fixType = (uint8_t)tLib.gps.fixType();
   g.groundSpeed_cms = 0;
-  sendGps(g);
+  Proto::sendTyped(*sSerial, Proto::MSG_GPS, 0, nextSeq(), g);
 }
 
 static void sendOneShotImu(Tonttulib& tLib) {
