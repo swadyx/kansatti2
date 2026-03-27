@@ -16,7 +16,8 @@
   #define DBG_PRINTF(...)
 #endif
 
-uint8_t bridgeMAC[] = { 0x80, 0xB5, 0x4E, 0xF1, 0x22, 0x34 };
+uint8_t bridgeMAC[] = { 0x1C, 0xDB, 0xD4, 0x5B, 0x0C, 0xD8 };
+//  1C:DB:D4:5B:0C:D8
 static esp_now_peer_info_t peerInfo{};
 static uint16_t txSeq = 1;
 
