@@ -1,17 +1,15 @@
 #include "flightcontroller.h"
 #include "sensors.h"
-#include "motor.h"
 #include <math.h>
-#include <Tonttulib.h>
 
 // ===================== USER SETTINGS =====================
-static constexpr float THRUST_MIN = 0.00f;
-static constexpr float THRUST_MAX = 0.90f;
+static constexpr float THRUST_MIN = 0.2f;
+static constexpr float THRUST_MAX = 0.8f;
 
 // Hold motors at 1000 us for 8 s after powered flight begins
-static constexpr uint32_t POWERED_FLIGHT_DELAY_US = 8000000UL;
+static constexpr uint32_t POWERED_FLIGHT_DELAY_US = 8000000UL; //8000000UL;
 
-static float baseThrust  = 0.50f;
+static float baseThrust  = 0.40f;
 static bool  motorsArmed = false;
 
 // powered-flight gating
@@ -27,8 +25,8 @@ static constexpr float    ANGLE_DT            = ANGLE_PERIOD_US * 1e-6f;
 static constexpr float ANGLE_I_MAX        = 10.0f;
 static constexpr float MAX_ANGLE_RATE_DPS = 400.0f;
 
-static float RATE_KP_ROLL       = 0.001f;
-static float RATE_KP_PITCH      = 0.001f;
+static float RATE_KP_ROLL       = 0.0012f;
+static float RATE_KP_PITCH      = 0.0012f;
 static float RATE_KP_YAW        = 0.015f; 
 
 static float RATE_KI_ROLL       = 0.003f;
@@ -39,8 +37,8 @@ static float RATE_KD_ROLL       = 0.000004f;
 static float RATE_KD_PITCH      = 0.000004f;
 static float RATE_KD_YAW        = 0.000002f;
 
-static float ANGLE_KP_ROLL      = 1.5f;
-static float ANGLE_KP_PITCH     = 1.5f;
+static float ANGLE_KP_ROLL      = 1.6f;
+static float ANGLE_KP_PITCH     = 1.6f;
 static float ANGLE_KI_ROLL      = 2.0f;
 static float ANGLE_KI_PITCH     = 2.0f;
 
@@ -78,8 +76,9 @@ static double measuredPosX=0, measuredPosY=0;
 static double lastPosX=0, lastPosY=0;
 static double velX=0, velY=0;
 static uint32_t lastGpsTime=0;
+static bool firstGps = true;
 
-static float velEstX=0, velEstY=0;
+static double velEstX=0, velEstY=0;
 static float targetPositionX = 0.0f;
 static float targetPositionY = 0.0f;
 
@@ -102,20 +101,81 @@ static inline float clamp_f(float x, float lo, float hi) {
 
 static uint16_t m1_us=1000, m2_us=1000, m3_us=1000, m4_us=1000;
 
+static bool recoveredFromFlash = false;
+
+void FC::setRecovered(bool recovered) {
+    recoveredFromFlash = recovered;
+}
+
 static void motorsSetAll(uint16_t us) {
     tLib.motors.set(1, us);
     tLib.motors.set(2, us);
     tLib.motors.set(3, us);
     tLib.motors.set(4, us);
 }
+// ===================== VERTICAL VELOCITY PID =====================
+static constexpr float VZ_KP = 0.08f;
+static constexpr float VZ_KI = 0.02f;
+static constexpr float VZ_KD = 0.01f;
+static constexpr float VZ_TARGET = -5.0f;  // m/s, negative = descending
+static constexpr float VZ_I_MAX  = 0.15f;
+
+static float vzI = 0.0f;
+static float vzPrev = 0.0f;
+
+static float computeVerticalThrust(float vz, float dt) {
+    float err = VZ_TARGET - vz;
+
+    vzI = clamp_f(vzI + err * dt, -VZ_I_MAX, VZ_I_MAX);
+
+    float d = -(vz - vzPrev) / dt;
+    vzPrev = vz;
+
+    float out = baseThrust + VZ_KP * err + VZ_KI * vzI + VZ_KD * d;
+    return clamp_f(out, THRUST_MIN, THRUST_MAX);
+}
+
+// Convert pressure to altitude (meters)
+// ===================== BARO VELOCITY =====================
+static float vz_filt = 0.0f;
+static float lastAltM = 0.0f;
+static uint32_t lastBaroUs = 0;
+
+static constexpr float VZ_LPF_ALPHA = 0.2f;
+static constexpr uint32_t VZ_PERIOD_US = 20000; // 50 Hz
+
+static float pressureToAlt(float hPa) {
+    return 44330.0f * (1.0f - powf(hPa / Sensors::getGroundPressure(), 0.1903f));
+}
+
+static void updateVz(uint32_t nowUs) {
+    if (lastBaroUs == 0) {
+        lastAltM = pressureToAlt(Sensors::getPressure());
+        lastBaroUs = nowUs;
+        return;
+    }
+
+    if ((uint32_t)(nowUs - lastBaroUs) < VZ_PERIOD_US) return;
+
+    float alt = pressureToAlt(Sensors::getPressure());
+    float dt = (nowUs - lastBaroUs) * 1e-6f;
+    lastBaroUs = nowUs;
+
+    if (dt <= 0.0f) return;
+
+    float vz_raw = (alt - lastAltM) / dt;
+    lastAltM = alt;
+
+    vz_filt += VZ_LPF_ALPHA * (vz_raw - vz_filt);
+}
 
 static inline float rampThrust(uint32_t nowUs) {
-    if (!rampActive) return baseThrust;
+    if (!rampActive) return computeVerticalThrust(vz_filt, RATE_DT); // Replace baseThrust with new calculated thrust;
 
     float elapsed = (nowUs - rampStartUs) * 1e-6f;
     if (elapsed >= RAMP_DURATION_S) {
         rampActive = false;
-        return baseThrust;
+        return computeVerticalThrust(vz_filt, RATE_DT); // Replace baseThrust with new calculated thrust
     }
 
     float t = elapsed / RAMP_DURATION_S;
@@ -144,81 +204,39 @@ static void resetControllers() {
     velEstY = 0.0f;
 }
 
-// ===================== VERTICAL VELOCITY PID =====================
-static constexpr float VZ_KP = 0.08f;
-static constexpr float VZ_KI = 0.02f;
-static constexpr float VZ_KD = 0.01f;
-static constexpr float VZ_TARGET = -5.0f;  // m/s, negative = descending
-static constexpr float VZ_I_MAX  = 0.15f;
-
-static float vzI = 0.0f;
-static float vzPrev = 0.0f;
-
-static float computeVerticalThrust(float vz, float dt) {
-    float err = VZ_TARGET - vz;
-
-    vzI = clamp_f(vzI + err * dt, -VZ_I_MAX, VZ_I_MAX);
-
-    float d = -(vz - vzPrev) / dt;
-    vzPrev = vz;
-
-    float out = baseThrust + VZ_KP * err + VZ_KI * vzI + VZ_KD * d;
-    return clamp_f(out, THRUST_MIN, THRUST_MAX);
-}
-// ===================== BARO VELOCITY =====================
-static float vz_filt = 0.0f;
-static float lastAltM = 0.0f;
-static uint32_t lastBaroUs = 0;
-
-static constexpr float VZ_LPF_ALPHA = 0.2f;
-
-// Convert pressure to altitude (meters)
-static float pressureToAlt(float hPa) {
-    return 44330.0f * (1.0f - powf(hPa / Sensors::getGroundPressure(), 0.1903f));
-}
-
-static void updateVz(uint32_t nowUs) {
-    float alt = pressureToAlt(Sensors::getPressure());
-    if (lastBaroUs == 0) {
-        lastAltM   = alt;
-        lastBaroUs = nowUs;
-        return;
-    }
-    float dt = (nowUs - lastBaroUs) * 1e-6f;
-    lastBaroUs = nowUs;
-
-    float vz_raw = (alt - lastAltM) / dt;
-    lastAltM = alt;
-
-    vz_filt += VZ_LPF_ALPHA * (vz_raw - vz_filt);
-}
 
 // ===================== API =====================
 void FC::init() {
-    motorsArmed = false;
-    poweredFlightStarted = false;
-    poweredFlightStartUs = 0;
-    rampActive = false;
-    rampStartUs = 0;
+    if(motorsArmed){
+        motorsArmed = false;
+        poweredFlightStarted = false;
+        poweredFlightStartUs = 0;
+        rampActive = false;
+        rampStartUs = 0;
 
-    resetControllers();
-    motorsSetAll(1000);
+        resetControllers();
+        motorsSetAll(1000);
+    }
 }
 
 void FC::arm() {
-    motorsArmed = true;
-    motorsSetAll(1000);
+    if(!motorsArmed){
+        motorsArmed = true;
+        motorsSetAll(1000);
+    }
 }
 
 void FC::disarm() {
-    motorsArmed = false;
-    poweredFlightStarted = false;
-    poweredFlightStartUs = 0;
-    rampActive = false;
-    rampStartUs = 0;
+    if(motorsArmed){
+        motorsArmed = false;
+        poweredFlightStarted = false;
+        poweredFlightStartUs = 0;
+        rampActive = false;
+        rampStartUs = 0;
 
-    resetControllers();
-    motorsSetAll(1000);
+        resetControllers();
+        motorsSetAll(1000);
+    }
 }
 
 bool FC::isArmed() {
@@ -238,6 +256,8 @@ void FC::beginPoweredFlight(uint32_t nowUs) {
 bool FC::thrustEnabled(uint32_t nowUs) {
     if (!motorsArmed) return false;
     if (!poweredFlightStarted) return false;
+    if (!recoveredFromFlash) return true;
+
     return (uint32_t)(nowUs - poweredFlightStartUs) >= POWERED_FLIGHT_DELAY_US;
 }
 
@@ -272,8 +292,11 @@ void FC::update(uint32_t nowUs) {
     updateVz(nowUs);
 
     if (Sensors::gpsHasNew()) {
+        if(firstGps) {lastGpsTime = millis();firstGps = false;}
         double lat = Sensors::getLat();
         double lon = Sensors::getLon();
+        Sensors::updateVelocity(nowUs);
+
 
         measuredPosX = (lon - targetLon) * cos(targetLat * DEG_TO_RAD) * 111320.0;
         measuredPosY = (lat - targetLat) * 111320.0;
@@ -330,7 +353,7 @@ void FC::update(uint32_t nowUs) {
     }
 
     if ((int32_t)(nowUs - lastRateUs) >= (int32_t)RATE_PERIOD_US) {
-        lastRateUs += RATE_PERIOD_US;
+        lastRateUs = nowUs;
 
         gx_f += GYRO_LPF_ALPHA * (Sensors::getGyroX() - gx_f);
         gy_f += GYRO_LPF_ALPHA * (Sensors::getGyroY() - gy_f);
@@ -394,9 +417,6 @@ void FC::update(uint32_t nowUs) {
         }
 
         float thrustNow = rampThrust(nowUs);
-        if(!rampActive) {
-            thrustNow = computeVerticalThrust(vz_filt, RATE_DT);
-        }
 
         float m1 = thrustNow + rollOut  + yawOut;
         float m2 = thrustNow + pitchOut - yawOut;
