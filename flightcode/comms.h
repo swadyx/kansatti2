@@ -55,9 +55,6 @@ void update(::Tonttulib& tLib);
 
 // Outgoing packets: caller passes prepared data
 void sendStatus(const StatusData& data);
-void sendPrimaryMission(const PrimaryMissionData& data);
-void sendAttitude(const AttitudeData& data);
-void sendGps(const GpsData& data);
 void sendImuRaw(const ImuRawData& data);
 
 void sendBootEvent();
